@@ -1,0 +1,311 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(ggthemes)
+if (!requireNamespace("uwot", quietly = TRUE)) {
+  install.packages("uwot", repos = "https://cloud.r-project.org")
+}
+library(uwot)
+if (!requireNamespace("stringr", quietly = TRUE)) {
+  install.packages("stringr", repos = "https://cloud.r-project.org")
+}
+library(stringr)
+if (!requireNamespace("patchwork", quietly = TRUE)) {
+  install.packages("patchwork", repos = "https://cloud.r-project.org")
+}
+library(patchwork)
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
+  install.packages("RColorBrewer", repos = "https://cloud.r-project.org")
+}
+library(RColorBrewer)
+if (!requireNamespace("Polychrome", quietly = TRUE)) {
+  install.packages("Polychrome", repos = "https://cloud.r-project.org")
+}
+if (!requireNamespace("randomcoloR", quietly = TRUE)) {
+  install.packages("randomcoloR", repos = "https://cloud.r-project.org")
+}
+```
+
+
+```{r}
+## Configuration
+data_dir <- file.path("scripts", "data")
+if (!dir.exists(data_dir)) {
+  data_dir <- "data"
+}
+
+# Helper: safely list TSV files
+list_tsv <- function(path) {
+  fs <- list.files(path, pattern = "\\.tsv$", full.names = TRUE, recursive = TRUE)
+  unique(normalizePath(fs, mustWork = FALSE))
+}
+
+all_files <- list_tsv(data_dir)
+subtype_files <- all_files[stringr::str_detect(tolower(basename(all_files)), "subtype")]
+gene_files    <- all_files[stringr::str_detect(tolower(basename(all_files)), "gene")]
+
+message(sprintf("Found %d TSVs (%d subtype, %d gene)", length(all_files), length(subtype_files), length(gene_files)))
+
+# Helper: read a TSV into a data.frame with a filename column
+read_tsv_with_name <- function(fp) {
+  dt <- tryCatch(data.table::fread(fp), error = function(e) NULL)
+  if (is.null(dt)) return(NULL)
+  df <- as.data.frame(dt)
+  df$.__file__ <- basename(fp)
+  df
+}
+
+subtype_tables <- Filter(Negate(is.null), lapply(subtype_files, read_tsv_with_name))
+gene_tables    <- Filter(Negate(is.null), lapply(gene_files, read_tsv_with_name))
+
+# Build per-file feature matrices where columns are genes and values are "cDNA %"
+# Each row represents a file; missing genes are filled with 0
+extract_gene_percent <- function(df) {
+  if (is.null(df) || !nrow(df)) return(numeric(0))
+  cn <- names(df)
+  # Locate gene and value columns by pattern
+  gene_idx <- which(grepl("^Gene name", cn, ignore.case = TRUE))
+  if (length(gene_idx) == 0) gene_idx <- which(grepl("gene", cn, ignore.case = TRUE) & grepl("id|name", cn, ignore.case = TRUE))
+  val_idx  <- which(grepl("^cDNA\\s*%$", cn, ignore.case = TRUE) | grepl("cDNA", cn, ignore.case = TRUE) & grepl("%", cn))
+  if (length(gene_idx) == 0 || length(val_idx) == 0) return(numeric(0))
+  gcol <- cn[gene_idx[1]]
+  vcol <- cn[val_idx[1]]
+  g <- as.character(df[[gcol]])
+  v <- df[[vcol]]
+  # Coerce to numeric (values already 0-100, no % symbol)
+  v <- suppressWarnings(as.numeric(v))
+  v[is.na(v)] <- 0
+  # Aggregate duplicate genes by mean (if any)
+  tapply(v, g, function(x) mean(x, na.rm = TRUE))
+}
+
+make_gene_feature_matrix <- function(tabs) {
+  if (length(tabs) == 0) return(NULL)
+  vecs <- lapply(tabs, extract_gene_percent)
+  # remove empties
+  keep <- vapply(vecs, function(v) length(v) > 0, logical(1))
+  tabs <- tabs[keep]
+  vecs <- vecs[keep]
+  if (!length(vecs)) return(NULL)
+  genes <- sort(unique(unlist(lapply(vecs, names))))
+  m <- matrix(0, nrow = length(vecs), ncol = length(genes))
+  colnames(m) <- genes
+  rownames(m) <- vapply(tabs, function(tb) unique(tb$.__file__)[1], character(1))
+  for (i in seq_along(vecs)) {
+    v <- vecs[[i]]
+    idx <- match(names(v), genes)
+    m[i, idx] <- as.numeric(v)
+  }
+  # Return as data.frame with file column
+  df <- as.data.frame(m, check.names = FALSE)
+  df$file <- rownames(m)
+  df
+}
+
+## Build feature matrices with appropriate key per group
+# Generic extractor that uses provided key column patterns and cDNA % as values
+extract_key_percent <- function(df, key_patterns) {
+  if (is.null(df) || !nrow(df)) return(numeric(0))
+  cn <- names(df)
+  # find key col: first column whose name matches any provided pattern (case-insensitive)
+  key_idx <- which(vapply(cn, function(nm) any(sapply(key_patterns, function(p) grepl(p, nm, ignore.case = TRUE))), logical(1)))
+  # find value col: cDNA %
+  val_idx  <- which(grepl("^cDNA\\s*%$", cn, ignore.case = TRUE) | (grepl("cDNA", cn, ignore.case = TRUE) & grepl("%|percent", cn, ignore.case = TRUE)))
+  if (length(key_idx) == 0 || length(val_idx) == 0) return(numeric(0))
+  kcol <- cn[key_idx[1]]
+  vcol <- cn[val_idx[1]]
+  keys <- as.character(df[[kcol]])
+  vals <- suppressWarnings(as.numeric(df[[vcol]]))
+  vals[is.na(vals)] <- 0
+  tapply(vals, keys, function(x) mean(x, na.rm = TRUE))
+}
+
+make_feature_matrix <- function(tabs, key_patterns) {
+  if (length(tabs) == 0) return(NULL)
+  vecs <- lapply(tabs, function(tb) extract_key_percent(tb, key_patterns))
+  keep <- vapply(vecs, function(v) length(v) > 0, logical(1))
+  tabs <- tabs[keep]
+  vecs <- vecs[keep]
+  if (!length(vecs)) return(NULL)
+  keys <- sort(unique(unlist(lapply(vecs, names))))
+  m <- matrix(0, nrow = length(vecs), ncol = length(keys))
+  colnames(m) <- keys
+  rownames(m) <- vapply(tabs, function(tb) unique(tb$.__file__)[1], character(1))
+  for (i in seq_along(vecs)) {
+    v <- vecs[[i]]
+    idx <- match(names(v), keys)
+    m[i, idx] <- as.numeric(v)
+  }
+  df <- as.data.frame(m, check.names = FALSE)
+  df$file <- rownames(m)
+  df
+}
+
+# Subtype uses 'Subtype' key; Gene uses 'Gene name (Gene ID)'
+subtype_features <- make_feature_matrix(subtype_tables, key_patterns = c("^Subtype$", "Subtype"))
+gene_features    <- make_feature_matrix(gene_tables,    key_patterns = c("^Gene name", "Gene name", "gene.*(id|name)"))
+
+run_umap_features <- function(feature_df, label_col = "file", n_neighbors = 15, min_dist = 0.1, scale_data = TRUE) {
+  if (is.null(feature_df)) return(NULL)
+  df <- feature_df
+  stopifnot(label_col %in% names(df))
+  X <- dplyr::select(df, -all_of(label_col))
+  if (ncol(X) < 2 || nrow(X) < 3) return(NULL)
+  mat <- as.matrix(X)
+  if (scale_data) mat <- scale(mat)
+  set.seed(42)
+  emb <- uwot::umap(mat, n_neighbors = n_neighbors, min_dist = min_dist, verbose = FALSE)
+  out <- as.data.frame(emb)
+  colnames(out) <- c("UMAP1", "UMAP2")
+  out[[label_col]] <- df[[label_col]]
+  # Derive group from filename prefix before first underscore
+  out$group <- sub("_.*$", "", out[[label_col]])
+  out
+}
+
+subtype_umap <- run_umap_features(subtype_features)
+gene_umap    <- run_umap_features(gene_features)
+
+if (!is.null(subtype_umap) || !is.null(gene_umap)) {
+  # Build a high-contrast categorical palette shared across both plots (consistent colors)
+  all_groups <- unique(c(
+    if (!is.null(subtype_umap)) as.character(unique(subtype_umap$group)) else character(0),
+    if (!is.null(gene_umap)) as.character(unique(gene_umap$group)) else character(0)
+  ))
+  n_groups <- length(all_groups)
+  if (requireNamespace("Polychrome", quietly = TRUE)) {
+    pal_vals <- Polychrome::createPalette(n_groups, seedcolors = c("#000000", "#FFFFFF"))
+  } else if (requireNamespace("randomcoloR", quietly = TRUE)) {
+    pal_vals <- randomcoloR::distinctColorPalette(n_groups)
+  } else {
+    base_max <- brewer.pal.info["Set1", "maxcolors"]
+    pal_fn <- colorRampPalette(brewer.pal(max(3, min(n_groups, base_max)), "Set1"))
+    pal_vals <- pal_fn(n_groups)
+  }
+  names(pal_vals) <- all_groups
+
+  p1 <- NULL
+  p2 <- NULL
+  if (!is.null(subtype_umap)) {
+    p1 <- ggplot(subtype_umap, aes(UMAP1, UMAP2, color = group)) +
+      geom_point(size = 2, alpha = 0.8) +
+      ggthemes::theme_few() +
+      scale_color_manual(values = pal_vals[as.character(all_groups)], breaks = all_groups) +
+      guides(color = guide_legend(override.aes = list(size = 3))) +
+      labs(title = "Subtype files (per-file cDNA% features)", color = "Group")
+  }
+  if (!is.null(gene_umap)) {
+    p2 <- ggplot(gene_umap, aes(UMAP1, UMAP2, color = group)) +
+      geom_point(size = 2, alpha = 0.8) +
+      ggthemes::theme_few() +
+      scale_color_manual(values = pal_vals[as.character(all_groups)], breaks = all_groups) +
+      guides(color = guide_legend(override.aes = list(size = 3))) +
+      labs(title = "Gene files (per-file cDNA% features)", color = "Group")
+  }
+  if (!is.null(p1) && !is.null(p2)) {
+    print(p1 + p2 + patchwork::plot_layout(ncol = 2))
+  } else if (!is.null(p1)) {
+    print(p1)
+  } else if (!is.null(p2)) {
+    print(p2)
+  }
+}
+
+```
+
+```{r}
+# t-SNE version: same features, file-level points, colored by filename prefix
+if (!requireNamespace("Rtsne", quietly = TRUE)) {
+  install.packages("Rtsne", repos = "https://cloud.r-project.org")
+}
+library(Rtsne)
+
+run_tsne_features <- function(feature_df, label_col = "file", perplexity = NULL, scale_data = TRUE) {
+  if (is.null(feature_df)) return(NULL)
+  df <- feature_df
+  stopifnot(label_col %in% names(df))
+  X <- dplyr::select(df, -all_of(label_col))
+  n <- nrow(X)
+  if (ncol(X) < 2 || n < 3) return(NULL)
+  mat <- as.matrix(X)
+  if (scale_data) mat <- scale(mat)
+  if (is.null(perplexity)) {
+    # Heuristic: keep within valid range (perplexity < (n - 1)/3)
+    perplexity <- max(5, min(30, floor((n - 1) / 3)))
+  }
+  set.seed(42)
+  ts <- Rtsne::Rtsne(mat, perplexity = perplexity, verbose = FALSE, check_duplicates = FALSE, pca = TRUE)
+  emb <- as.data.frame(ts$Y)
+  colnames(emb) <- c("TSNE1", "TSNE2")
+  emb[[label_col]] <- df[[label_col]]
+  emb$group <- sub("_.*$", "", emb[[label_col]])
+  emb
+}
+
+subtype_tsne <- run_tsne_features(subtype_features)
+gene_tsne    <- run_tsne_features(gene_features)
+
+if (!is.null(subtype_tsne) || !is.null(gene_tsne)) {
+  # High-contrast categorical palette shared across both plots
+  if (!requireNamespace("Polychrome", quietly = TRUE)) {
+    install.packages("Polychrome", repos = "https://cloud.r-project.org")
+  }
+  if (!requireNamespace("randomcoloR", quietly = TRUE)) {
+    install.packages("randomcoloR", repos = "https://cloud.r-project.org")
+  }
+
+  all_groups <- unique(c(
+    if (!is.null(subtype_tsne)) as.character(unique(subtype_tsne$group)) else character(0),
+    if (!is.null(gene_tsne)) as.character(unique(gene_tsne$group)) else character(0)
+  ))
+  n_groups <- length(all_groups)
+  if (requireNamespace("Polychrome", quietly = TRUE)) {
+    pal_vals <- Polychrome::createPalette(n_groups, seedcolors = c("#000000", "#FFFFFF"))
+  } else if (requireNamespace("randomcoloR", quietly = TRUE)) {
+    pal_vals <- randomcoloR::distinctColorPalette(n_groups)
+  } else {
+    if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
+      install.packages("RColorBrewer", repos = "https://cloud.r-project.org")
+    }
+    base_max <- RColorBrewer::brewer.pal.info["Set1", "maxcolors"]
+    pal_fn <- colorRampPalette(RColorBrewer::brewer.pal(max(3, min(n_groups, base_max)), "Set1"))
+    pal_vals <- pal_fn(n_groups)
+  }
+  names(pal_vals) <- all_groups
+
+  p1 <- NULL
+  p2 <- NULL
+  if (!is.null(subtype_tsne)) {
+    p1 <- ggplot(subtype_tsne, aes(TSNE1, TSNE2, color = group)) +
+      geom_point(size = 2, alpha = 0.8) +
+      ggthemes::theme_few() +
+      scale_color_manual(values = pal_vals[as.character(all_groups)], breaks = all_groups) +
+      guides(color = guide_legend(override.aes = list(size = 3))) +
+      labs(title = "Subtype files (t-SNE of per-file cDNA% features)", color = "Group")
+  }
+  if (!is.null(gene_tsne)) {
+    p2 <- ggplot(gene_tsne, aes(TSNE1, TSNE2, color = group)) +
+      geom_point(size = 2, alpha = 0.8) +
+      ggthemes::theme_few() +
+      scale_color_manual(values = pal_vals[as.character(all_groups)], breaks = all_groups) +
+      guides(color = guide_legend(override.aes = list(size = 3))) +
+      labs(title = "Gene files (t-SNE of per-file cDNA% features)", color = "Group")
+  }
+  if (!is.null(p1) && !is.null(p2)) {
+    print(p1 + p2 + patchwork::plot_layout(ncol = 2))
+  } else if (!is.null(p1)) {
+    print(p1)
+  } else if (!is.null(p2)) {
+    print(p2)
+  }
+}
+```
+
