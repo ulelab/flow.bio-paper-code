@@ -1,6 +1,8 @@
 import os
 import sys
 import re
+import time
+import random
 from typing import Dict, List, Any, Iterable, Tuple
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,14 +22,16 @@ FILENAME_REGEX = r"(gene_premapadjusted\.tsv$)|(subtype_premapadjusted\.tsv$)"
 
 # Set your output JSON file path here
 OUTPUT_JSON = "filtered_data.json"
+INPUT_JSON = "filtered_data.json"  # Optional: path to an existing filtered_data.json to skip API fetch
 
 # Concurrency and paging settings
-MAX_WORKERS = 8
+MAX_WORKERS = 1
 PER_PAGE_COUNT = 100
-MAX_DOWNLOAD_WORKERS = 4
+MAX_DOWNLOAD_WORKERS = 1
 DATA_DIR = "data"
 MAX_DOWNLOAD_RETRIES = 5
 INITIAL_BACKOFF_SEC = 1.0
+REQUEST_DELAY_SEC = 0.25
 
 # Desired sample type to process
 SAMPLE_TYPE = "CLIP"
@@ -90,6 +94,8 @@ def paginate_items(session: requests.Session, url: str, base_params: Dict[str, A
         for item in items:
             yield item
         page += 1
+        if REQUEST_DELAY_SEC:
+            time.sleep(REQUEST_DELAY_SEC)
 
 
 def get_all_public_samples(session: requests.Session, sample_type: str | None = None) -> List[Dict[str, Any]]:
@@ -222,7 +228,7 @@ def download_file(session: requests.Session, record: Dict[str, Any]) -> Tuple[st
     if not data_id or not filename:
         return ("Missing id/filename; skipping", False)
     # Construct download URL
-    url = f"https://files.flow.bio/downloads/{quote(data_id)}/{quote(filename)}"
+    url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(filename)}"
     # Determine destination path
     dest_path = _safe_join_filename(DATA_DIR, filename)
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
@@ -239,6 +245,9 @@ def download_file(session: requests.Session, record: Dict[str, Any]) -> Tuple[st
                         for chunk in resp.iter_content(chunk_size=1024 * 1024):
                             if chunk:
                                 f.write(chunk)
+                    # brief delay after a successful download
+                    if REQUEST_DELAY_SEC:
+                        time.sleep(REQUEST_DELAY_SEC)
                     return (f"Saved {dest_path}", True)
 
                 status = resp.status_code
@@ -247,13 +256,11 @@ def download_file(session: requests.Session, record: Dict[str, Any]) -> Tuple[st
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after:
                         try:
-                            import time
                             sleep_s = float(retry_after)
                             time.sleep(max(0.0, sleep_s))
                         except Exception:
                             pass
                     else:
-                        import time, random
                         time.sleep(backoff + random.uniform(0, backoff / 2))
                         backoff = min(backoff * 2, 30)
                     continue
@@ -262,7 +269,6 @@ def download_file(session: requests.Session, record: Dict[str, Any]) -> Tuple[st
                 return (f"HTTP {status} for {url}; skipped", False)
         except requests.exceptions.RequestException as e:
             # Network-level error; retry with backoff
-            import time, random
             time.sleep(backoff + random.uniform(0, backoff / 2))
             backoff = min(backoff * 2, 30)
             last_err = str(e)
@@ -353,25 +359,48 @@ def main() -> None:
     with requests.Session() as session:
         session.headers.update({"Authorization": f"Bearer {access_token}"})
 
-        print("Fetching public samples...")
-        samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
-        # Client-side filter by sample_type/type to be safe
-        desired = SAMPLE_TYPE.upper()
-        samples = [s for s in samples if (str(s.get("sample_type") or s.get("type") or "").upper() == desired)]
-        print(f"Found {len(samples)} public samples of type {SAMPLE_TYPE}")
-
         all_data: List[Dict[str, Any]] = []
-        # Parallelize per-sample processing
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_sample, session, compiled_patterns, s) for s in samples]
-            for fut in as_completed(futures):
-                msg, results = fut.result()
-                if msg:
-                    print(msg)
-                if results:
-                    all_data.extend(results)
+        if INPUT_JSON and os.path.exists(INPUT_JSON):
+            try:
+                import json
+                with open(INPUT_JSON, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    all_data = loaded
+                    print(f"Loaded {len(all_data)} records from {INPUT_JSON}; skipping API fetch")
+                else:
+                    print(f"Input JSON {INPUT_JSON} is not a list; ignoring and proceeding with API fetch")
+            except Exception as e:
+                print(f"Failed to read {INPUT_JSON}: {e}; proceeding with API fetch")
+        samples = None
+        if not all_data:
+            print("Fetching public samples...")
+            samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
+            # Client-side filter by sample_type/type to be safe
+            desired = SAMPLE_TYPE.upper()
+            samples = [s for s in samples if (str(s.get("sample_type") or s.get("type") or "").upper() == desired)]
+            print(f"Found {len(samples)} public samples of type {SAMPLE_TYPE}")
 
-        print(f"Fetched {len(all_data)} total data files across {len(samples)} samples after filtering")
+            # Parallelize per-sample processing
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [executor.submit(process_sample, session, compiled_patterns, s) for s in samples]
+                for fut in as_completed(futures):
+                    msg, results = fut.result()
+                    if msg:
+                        print(msg)
+                    if results:
+                        all_data.extend(results)
+
+        # Compute a safe sample count for summary
+        if samples is None:
+            try:
+                sample_ids = {str(r.get("sample_id") or "") for r in all_data}
+                samples_count = len([sid for sid in sample_ids if sid])
+            except Exception:
+                samples_count = 0
+        else:
+            samples_count = len(samples)
+        print(f"Fetched {len(all_data)} total data files across {samples_count} samples after filtering")
         if regex_env.strip():
             print(f"Filename regex(es): {regex_env}")
         else:
