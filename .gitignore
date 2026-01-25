@@ -2,3 +2,15 @@ scripts/credentials.json
 scripts/download_files.sh
 scripts/filtered_data.json
 data
+*png
+*pdf
+*tsv
+*json
+*csv
+*html
+*dump
+*DS_Store
+scripts/plot_dataset_overview.py
+scripts/plot_sankey.py
+scripts/__pycache__/*
+scripts/peka_multiqc_summary.py

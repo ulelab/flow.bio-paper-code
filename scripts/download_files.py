@@ -1,10 +1,28 @@
+#!/usr/bin/env python3
+"""
+Download CLIP sample data files from Flow.bio.
+
+Usage:
+    python download_files.py                           # Download UMICollapse logs (default)
+    python download_files.py --debug                   # Show first sample's data records
+    python download_files.py --regex ".*subtype.*tsv" --dir data_subtype --json subtype_data.json
+    
+Examples:
+    # Download UMICollapse log files (default)
+    python download_files.py
+    
+    # Download subtype TSV files
+    python download_files.py --regex ".*summary_subtype_premapadjusted\\.tsv" --dir data_subtype --json subtype_data.json
+    
+    # Download gene TSV files  
+    python download_files.py --regex ".*gene_premapadjusted\\.tsv" --dir data_gene --json gene_data.json
+"""
+
+import argparse
 import os
 import sys
-import re
-import time
-import random
-from typing import Dict, List, Any, Iterable, Tuple
-from urllib.parse import quote
+import json
+from typing import Dict, List, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -13,178 +31,129 @@ except ImportError:
     print("This script requires the 'requests' package. Install with: pip install requests", file=sys.stderr)
     sys.exit(1)
 
+from flow_api import (
+    load_credentials,
+    get_access_token,
+    get_all_public_samples,
+    get_all_sample_data,
+    filter_samples_by_type,
+    compile_filename_regexes,
+    filter_by_regex,
+    dedupe_latest_by_filename,
+    download_file,
+    flatten_data_dir,
+)
+
+
+# =============================================================================
+# Configuration (defaults, can be overridden via command line)
+# =============================================================================
 
 BASE_URL = "https://api.flow.bio"
 
-# Set your filename regex here (comma-separated to support multiple patterns)
-# Example: r"(gene_premapadjusted\.tsv$)|(subtype_premapadjusted\.tsv$)"
-FILENAME_REGEX = r"(gene_premapadjusted\.tsv$)|(subtype_premapadjusted\.tsv$)"
+# Default filename regex
+DEFAULT_REGEX = r"(.*unique_genome.dedup_UMICollapse.log)"
 
-# Set your output JSON file path here
-OUTPUT_JSON = "filtered_data.json"
-INPUT_JSON = "filtered_data.json"  # Optional: path to an existing filtered_data.json to skip API fetch
+# Default output paths
+DEFAULT_JSON = "filtered_data.json"
+DEFAULT_DATA_DIR = "data"
 
-# Concurrency and paging settings
-MAX_WORKERS = 1
-PER_PAGE_COUNT = 100
-MAX_DOWNLOAD_WORKERS = 1
-DATA_DIR = "data"
-MAX_DOWNLOAD_RETRIES = 5
-INITIAL_BACKOFF_SEC = 1.0
-REQUEST_DELAY_SEC = 0.25
+# Processing settings
+MAX_WORKERS = 8          # Parallel sample processing
+MAX_DOWNLOAD_WORKERS = 4  # Parallel downloads
 
-# Desired sample type to process
+# Desired sample type
 SAMPLE_TYPE = "CLIP"
 
-# Path to credentials file (JSON with keys: username, password)
+# Credentials file path
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "credentials.json")
 
 
-def get_access_token(username: str, password: str) -> str:
-    login_resp = requests.post(
-        f"{BASE_URL}/login",
-        headers={"Content-Type": "application/json"},
-        json={"username": username, "password": password},
-        timeout=30,
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Download CLIP sample data files from Flow.bio",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Download UMICollapse log files (default)
+  python download_files.py
+  
+  # Download subtype TSV files
+  python download_files.py --regex ".*summary_subtype_premapadjusted\\.tsv" --dir data_subtype --json subtype_data.json
+  
+  # Download gene TSV files
+  python download_files.py --regex ".*gene_premapadjusted\\.tsv" --dir data_gene --json gene_data.json
+  
+  # Force fresh API fetch (ignore cached JSON)
+  python download_files.py --fresh
+        """
     )
-    login_resp.raise_for_status()
-    refresh_token = login_resp.json().get("token")
-    if not refresh_token:
-        raise RuntimeError("No refresh token in login response")
-
-    token_resp = requests.get(
-        f"{BASE_URL}/token",
-        headers={"Content-Type": "application/json"},
-        cookies={"flow_refresh_token": refresh_token},
-        timeout=30,
+    parser.add_argument(
+        "--regex", "-r",
+        default=DEFAULT_REGEX,
+        help=f"Filename regex pattern to match (default: {DEFAULT_REGEX})"
     )
-    token_resp.raise_for_status()
-    access_token = token_resp.json().get("token")
-    if not access_token:
-        raise RuntimeError("No access token in token response")
-    return access_token
+    parser.add_argument(
+        "--dir", "-d",
+        default=DEFAULT_DATA_DIR,
+        help=f"Output directory for downloaded files (default: {DEFAULT_DATA_DIR})"
+    )
+    parser.add_argument(
+        "--json", "-j",
+        default=DEFAULT_JSON,
+        help=f"JSON file for caching file metadata (default: {DEFAULT_JSON})"
+    )
+    parser.add_argument(
+        "--fresh", "-f",
+        action="store_true",
+        help="Force fresh API fetch, ignore cached JSON"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show all data records from the first CLIP sample"
+    )
+    parser.add_argument(
+        "--slurm",
+        action="store_true",
+        help="Generate SLURM job scripts instead of downloading directly"
+    )
+    parser.add_argument(
+        "--slurm-dir",
+        default="slurm_jobs",
+        help="Directory for SLURM job scripts (default: slurm_jobs)"
+    )
+    parser.add_argument(
+        "--no-sample-id-prefix",
+        action="store_true",
+        help="Don't prefix filenames with sample_id (not recommended)"
+    )
+    return parser.parse_args()
 
 
-def paginate_items(session: requests.Session, url: str, base_params: Dict[str, Any] | None = None) -> Iterable[Dict[str, Any]]:
-    params = dict(base_params or {})
-    page = 1
-    per_page = int(params.pop("count", PER_PAGE_COUNT))
-    while True:
-        params_with_page = {**params, "page": page, "count": per_page}
-        resp = session.get(url, params=params_with_page, timeout=60)
-        try:
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError:
-            status = resp.status_code if resp is not None else None
-            if status is not None and 500 <= status < 600:
-                print(f"Server error {status} for {resp.url}; skipping this resource")
-                return
-            raise
-        data = resp.json()
-        items = (
-            data.get("items")
-            or data.get("results")
-            or data.get("data")
-            or data.get("samples")
-            or []
-        )
-        # Quiet: avoid per-page logging for performance/readability
-        if not items:
-            break
-        for item in items:
-            yield item
-        page += 1
-        if REQUEST_DELAY_SEC:
-            time.sleep(REQUEST_DELAY_SEC)
+# =============================================================================
+# Sample Processing
+# =============================================================================
 
-
-def get_all_public_samples(session: requests.Session, sample_type: str | None = None) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {}
-    if sample_type:
-        params["sample_type"] = sample_type
-    return list(paginate_items(session, f"{BASE_URL}/samples/public", params))
-
-
-def get_all_sample_data(session: requests.Session, sample_id: str) -> List[Dict[str, Any]]:
-    return list(paginate_items(session, f"{BASE_URL}/samples/{sample_id}/data"))
-
-
-def filter_by_suffix(items: List[Dict[str, Any]], suffixes: List[str]) -> List[Dict[str, Any]]:
-    lowered = [s.lower() for s in suffixes]
-    result: List[Dict[str, Any]] = []
-    for item in items:
-        name = (item.get("filename") or item.get("name") or "").lower()
-        if any(name.endswith(suf) for suf in lowered):
-            result.append(item)
-    return result
-
-
-def compile_filename_regexes(regex_env: str, suffixes: List[str]) -> List[re.Pattern[str]]:
-    patterns: List[re.Pattern[str]] = []
-    parts = [p.strip() for p in (regex_env or "").split(",") if p.strip()]
-    if parts:
-        for p in parts:
-            patterns.append(re.compile(p, re.IGNORECASE))
-    else:
-        if suffixes:
-            escaped = [re.escape(s) for s in suffixes]
-            patterns.append(re.compile(r"(" + "|".join(escaped) + r")$", re.IGNORECASE))
-    return patterns
-
-
-def filter_by_regex(items: List[Dict[str, Any]], patterns: List[re.Pattern[str]]) -> List[Dict[str, Any]]:
-    if not patterns:
-        return items
-    result: List[Dict[str, Any]] = []
-    for item in items:
-        name = (item.get("filename") or item.get("name") or "")
-        for pat in patterns:
-            if pat.search(name):
-                result.append(item)
-                break
-    return result
-
-
-def _to_timestamp(value: Any) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        # Try ISO8601 parsing
-        try:
-            from datetime import datetime
-            if value.endswith("Z"):
-                value = value.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(value)
-            return dt.timestamp()
-        except Exception:
-            # Fallback: not parseable
-            return 0.0
-    return 0.0
-
-
-def dedupe_latest_by_filename(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    best_by_name: Dict[str, Dict[str, Any]] = {}
-    best_ts_by_name: Dict[str, float] = {}
-    for it in items:
-        fname = it.get("filename") or it.get("name")
-        if not fname:
-            continue
-        created_raw = it.get("created") or it.get("created_at") or it.get("timestamp")
-        ts = _to_timestamp(created_raw)
-        prev_ts = best_ts_by_name.get(fname, -1.0)
-        if ts >= prev_ts:
-            best_ts_by_name[fname] = ts
-            best_by_name[fname] = it
-    return list(best_by_name.values())
-
-
-def process_sample(session: requests.Session, compiled_patterns: List[re.Pattern[str]], sample: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
-    sample_id = str(sample.get("id") or sample.get("sample_id") or sample.get("uid") or sample.get("uuid") or "")
+def process_sample(
+    session: requests.Session,
+    compiled_patterns: List,
+    sample: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Process a single sample: fetch data, filter, and return matching files."""
+    sample_id = str(
+        sample.get("id")
+        or sample.get("sample_id")
+        or sample.get("uid")
+        or sample.get("uuid")
+        or ""
+    )
     sample_name = sample.get("name") or ""
+    
     if not sample_id:
         return ("", [])
+    
     try:
         data_items = get_all_sample_data(session, sample_id)
     except requests.exceptions.HTTPError as e:
@@ -199,6 +168,7 @@ def process_sample(session: requests.Session, compiled_patterns: List[re.Pattern
 
     filtered_items = filter_by_regex(data_items, compiled_patterns)
     unique_names = set((it.get("filename") or it.get("name") or "") for it in filtered_items)
+    
     if len(unique_names) < len(filtered_items):
         kept_items = dedupe_latest_by_filename(filtered_items)
     else:
@@ -212,178 +182,284 @@ def process_sample(session: requests.Session, compiled_patterns: List[re.Pattern
         }
         for d in kept_items
     ]
+    
     msg = f"Completed sample {sample_id} ({sample_name}): total={total_count}, matched={len(filtered_items)}, kept={len(kept_items)}"
     return (msg, results)
 
 
-def _safe_join_filename(directory: str, filename: str) -> str:
-    base = os.path.basename(filename)
-    return os.path.join(directory, base)
+def debug_first_sample(session: requests.Session) -> None:
+    """Debug function to show all data records from the first CLIP sample."""
+    print("=== DEBUG: First CLIP sample data records ===")
+    
+    samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
+    samples = filter_samples_by_type(samples, SAMPLE_TYPE)
+    
+    if not samples:
+        print("No CLIP samples found")
+        return
+    
+    first_sample = samples[0]
+    sample_id = str(
+        first_sample.get("id")
+        or first_sample.get("sample_id")
+        or first_sample.get("uid")
+        or first_sample.get("uuid")
+        or ""
+    )
+    sample_name = first_sample.get("name") or ""
+    
+    print(f"Sample ID: {sample_id}")
+    print(f"Sample Name: {sample_name}")
+    print()
+    
+    try:
+        data_items = get_all_sample_data(session, sample_id)
+        print(f"Found {len(data_items)} data records")
+        print()
+        
+        for item in data_items:
+            print(f"filename: {item.get('filename')}")
+    except Exception as e:
+        print(f"Error fetching data for sample {sample_id}: {e}")
 
 
-def download_file(session: requests.Session, record: Dict[str, Any]) -> Tuple[str, bool]:
-    file_obj = record.get("file", {})
-    data_id = str(file_obj.get("id") or "").strip()
-    filename = str(file_obj.get("filename") or file_obj.get("name") or "").strip()
-    if not data_id or not filename:
-        return ("Missing id/filename; skipping", False)
-    # Construct download URL
-    url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(filename)}"
-    # Determine destination path
-    dest_path = _safe_join_filename(DATA_DIR, filename)
-    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-        return (f"Exists: {dest_path}", True)
-    backoff = INITIAL_BACKOFF_SEC
-    attempts = 0
-    while attempts < MAX_DOWNLOAD_RETRIES:
-        attempts += 1
+# =============================================================================
+# SLURM job generation
+# =============================================================================
+
+def generate_slurm_jobs(all_data: List[Dict[str, Any]], data_dir: str, 
+                        slurm_dir: str, include_sample_id: bool = True) -> None:
+    """
+    Generate SLURM job scripts for downloading files on a cluster.
+    
+    Creates:
+    - Individual job scripts for each download
+    - A master script to submit all jobs
+    - A download helper script used by each job
+    """
+    os.makedirs(slurm_dir, exist_ok=True)
+    
+    # Create the download helper script
+    helper_script = os.path.join(slurm_dir, "download_single.py")
+    with open(helper_script, "w") as f:
+        f.write('''#!/usr/bin/env python3
+"""Helper script to download a single file from Flow.bio."""
+import argparse
+import os
+import sys
+import time
+import random
+
+try:
+    import requests
+except ImportError:
+    print("pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+def download_file(url, dest_path, max_retries=5):
+    """Download a file with retries."""
+    backoff = 1.0
+    for attempt in range(max_retries):
         try:
-            with session.get(url, stream=True, timeout=300) as resp:
+            with requests.get(url, stream=True, timeout=300) as resp:
                 if 200 <= resp.status_code < 300:
-                    os.makedirs(DATA_DIR, exist_ok=True)
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     with open(dest_path, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        for chunk in resp.iter_content(chunk_size=1024*1024):
                             if chunk:
                                 f.write(chunk)
-                    # brief delay after a successful download
-                    if REQUEST_DELAY_SEC:
-                        time.sleep(REQUEST_DELAY_SEC)
-                    return (f"Saved {dest_path}", True)
-
-                status = resp.status_code
-                # Retry on 429/5xx with backoff
-                if status == 429 or 500 <= status < 600:
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            sleep_s = float(retry_after)
-                            time.sleep(max(0.0, sleep_s))
-                        except Exception:
-                            pass
-                    else:
-                        time.sleep(backoff + random.uniform(0, backoff / 2))
-                        backoff = min(backoff * 2, 30)
+                    return True
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    time.sleep(backoff + random.uniform(0, backoff/2))
+                    backoff = min(backoff * 2, 30)
                     continue
-
-                # Non-retryable HTTP status
-                return (f"HTTP {status} for {url}; skipped", False)
-        except requests.exceptions.RequestException as e:
-            # Network-level error; retry with backoff
-            time.sleep(backoff + random.uniform(0, backoff / 2))
-            backoff = min(backoff * 2, 30)
-            last_err = str(e)
-            continue
+                print(f"HTTP {resp.status_code}", file=sys.stderr)
+                return False
         except Exception as e:
-            return (f"Error downloading {url}: {e}", False)
+            print(f"Attempt {attempt+1} failed: {e}", file=sys.stderr)
+            time.sleep(backoff)
+            backoff *= 2
+    return False
 
-    # Exhausted retries
-    msg = f"Failed after {MAX_DOWNLOAD_RETRIES} attempts: {url}"
-    try:
-        msg += f" (last error: {last_err})"
-    except NameError:
-        pass
-    return (msg, False)
-
-
-def _unique_dest_path(directory: str, filename: str) -> str:
-    base = os.path.basename(filename)
-    name, ext = os.path.splitext(base)
-    candidate = os.path.join(directory, base)
-    idx = 1
-    while os.path.exists(candidate):
-        candidate = os.path.join(directory, f"{name} ({idx}){ext}")
-        idx += 1
-    return candidate
-
-
-def flatten_data_dir(root_dir: str) -> Tuple[int, int]:
-    moved = 0
-    skipped = 0
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        # Skip the root itself for moving
-        if os.path.abspath(dirpath) == os.path.abspath(root_dir):
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--dest", required=True)
+    args = parser.parse_args()
+    
+    if os.path.exists(args.dest) and os.path.getsize(args.dest) > 0:
+        print(f"Exists: {args.dest}")
+        sys.exit(0)
+    
+    if download_file(args.url, args.dest):
+        print(f"Downloaded: {args.dest}")
+        sys.exit(0)
+    else:
+        print(f"Failed: {args.dest}", file=sys.stderr)
+        sys.exit(1)
+''')
+    os.chmod(helper_script, 0o755)
+    
+    # Generate individual job scripts
+    job_files = []
+    from urllib.parse import quote
+    
+    for i, record in enumerate(all_data):
+        file_obj = record.get("file", {})
+        sample_id = str(record.get("sample_id") or "").strip()
+        data_id = str(file_obj.get("id") or "").strip()
+        original_filename = str(file_obj.get("filename") or file_obj.get("name") or "").strip()
+        
+        if not data_id or not original_filename:
             continue
-        for fname in filenames:
-            src = os.path.join(dirpath, fname)
-            dest = os.path.join(root_dir, os.path.basename(fname))
-            if os.path.abspath(src) == os.path.abspath(dest):
-                skipped += 1
-                continue
-            if os.path.exists(dest):
-                dest = _unique_dest_path(root_dir, fname)
-            try:
-                os.replace(src, dest)
-                moved += 1
-            except Exception:
-                skipped += 1
-        # Attempt to clean up empty directories
-        try:
-            if not os.listdir(dirpath):
-                os.rmdir(dirpath)
-        except Exception:
-            pass
-    return moved, skipped
+        
+        if include_sample_id and sample_id:
+            filename = f"{sample_id}_{os.path.basename(original_filename)}"
+        else:
+            filename = os.path.basename(original_filename)
+        
+        url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(original_filename)}"
+        dest_path = os.path.join(data_dir, filename)
+        
+        job_name = f"dl_{i:05d}"
+        job_script = os.path.join(slurm_dir, f"{job_name}.sh")
+        
+        with open(job_script, "w") as f:
+            f.write(f'''#!/bin/bash
+#SBATCH --job-name={job_name}
+#SBATCH --output={slurm_dir}/logs/{job_name}.out
+#SBATCH --error={slurm_dir}/logs/{job_name}.err
+#SBATCH --time=00:30:00
+#SBATCH --mem=1G
+#SBATCH --cpus-per-task=1
 
+python3 {os.path.abspath(helper_script)} \\
+    --url "{url}" \\
+    --dest "{os.path.abspath(dest_path)}"
+''')
+        job_files.append(job_script)
+    
+    # Create logs directory
+    os.makedirs(os.path.join(slurm_dir, "logs"), exist_ok=True)
+    
+    # Create master submission script
+    master_script = os.path.join(slurm_dir, "submit_all.sh")
+    with open(master_script, "w") as f:
+        f.write(f'''#!/bin/bash
+# Submit all download jobs to SLURM
+# Generated by download_files.py
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "Submitting {len(job_files)} download jobs..."
+
+for job in dl_*.sh; do
+    sbatch "$job"
+    sleep 0.1  # Small delay to avoid overwhelming scheduler
+done
+
+echo "All jobs submitted. Monitor with: squeue -u $USER"
+''')
+    os.chmod(master_script, 0o755)
+    
+    # Create array job alternative (more efficient)
+    array_script = os.path.join(slurm_dir, "submit_array.sh")
+    with open(array_script, "w") as f:
+        f.write(f'''#!/bin/bash
+#SBATCH --job-name=flow_download
+#SBATCH --output={slurm_dir}/logs/array_%A_%a.out
+#SBATCH --error={slurm_dir}/logs/array_%A_%a.err
+#SBATCH --time=00:30:00
+#SBATCH --mem=1G
+#SBATCH --cpus-per-task=1
+#SBATCH --array=0-{len(job_files)-1}%50
+
+# Array job for efficient cluster submission
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Get the job script for this array index
+JOB_SCRIPT=$(ls dl_*.sh | sed -n "$((SLURM_ARRAY_TASK_ID + 1))p")
+
+if [ -n "$JOB_SCRIPT" ]; then
+    bash "$JOB_SCRIPT"
+else
+    echo "No job script found for index $SLURM_ARRAY_TASK_ID"
+    exit 1
+fi
+''')
+    os.chmod(array_script, 0o755)
+    
+    print(f"Generated {len(job_files)} SLURM job scripts in '{slurm_dir}/'")
+    print(f"Helper script: {helper_script}")
+    print(f"Submit all jobs: bash {master_script}")
+    print(f"Or use array job: sbatch {array_script}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main() -> None:
-    # Load credentials from file
-    if not os.path.exists(CREDENTIALS_PATH):
-        print(f"Credentials file not found: {CREDENTIALS_PATH}", file=sys.stderr)
-        print('Create it with JSON: {"username": "...", "password": "..."}', file=sys.stderr)
-        sys.exit(1)
-    try:
-        import json
-        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
-            creds = json.load(f)
-        username = str(creds.get("username") or "").strip()
-        password = str(creds.get("password") or "").strip()
-    except Exception as e:
-        print(f"Failed to read credentials from {CREDENTIALS_PATH}: {e}", file=sys.stderr)
-        sys.exit(1)
-    if not username or not password:
-        print("Missing username/password in credentials file", file=sys.stderr)
-        sys.exit(1)
-
-    suffix_env = os.environ.get("FLOWBIO_SUFFIXES", "")
-    filter_suffixes = [s.strip() for s in suffix_env.split(",") if s.strip()] or [
-        "gene_premapadjusted.tsv",
-        "subtype_premapadjusted.tsv"
-    ]
-    # Prefer in-script regex setting; if blank, fallback to suffixes
-    regex_env = FILENAME_REGEX
-    compiled_patterns = compile_filename_regexes(regex_env, filter_suffixes)
+    args = parse_args()
+    
+    # Use command-line arguments
+    filename_regex = args.regex
+    data_dir = args.dir
+    json_file = args.json
+    
+    username, password = load_credentials(CREDENTIALS_PATH)
+    compiled_patterns = compile_filename_regexes(filename_regex)
 
     access_token = get_access_token(username, password)
     print("Authenticated and obtained access token")
+
+    # Debug mode
+    if args.debug:
+        with requests.Session() as session:
+            session.headers.update({"Authorization": f"Bearer {access_token}"})
+            debug_first_sample(session)
+        return
+
+    print(f"\nConfiguration:")
+    print(f"  Regex:  {filename_regex}")
+    print(f"  Dir:    {data_dir}")
+    print(f"  JSON:   {json_file}")
+    print()
 
     with requests.Session() as session:
         session.headers.update({"Authorization": f"Bearer {access_token}"})
 
         all_data: List[Dict[str, Any]] = []
-        if INPUT_JSON and os.path.exists(INPUT_JSON):
+        
+        # Try loading from existing JSON first (unless --fresh)
+        if not args.fresh and json_file and os.path.exists(json_file):
             try:
-                import json
-                with open(INPUT_JSON, "r", encoding="utf-8") as f:
+                with open(json_file, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 if isinstance(loaded, list):
                     all_data = loaded
-                    print(f"Loaded {len(all_data)} records from {INPUT_JSON}; skipping API fetch")
+                    print(f"Loaded {len(all_data)} records from {json_file}; skipping API fetch")
+                    print("(use --fresh to force new API fetch)")
                 else:
-                    print(f"Input JSON {INPUT_JSON} is not a list; ignoring and proceeding with API fetch")
+                    print(f"Input JSON {json_file} is not a list; ignoring")
             except Exception as e:
-                print(f"Failed to read {INPUT_JSON}: {e}; proceeding with API fetch")
+                print(f"Failed to read {json_file}: {e}; proceeding with API fetch")
+        
         samples = None
         if not all_data:
             print("Fetching public samples...")
             samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
-            # Client-side filter by sample_type/type to be safe
-            desired = SAMPLE_TYPE.upper()
-            samples = [s for s in samples if (str(s.get("sample_type") or s.get("type") or "").upper() == desired)]
+            samples = filter_samples_by_type(samples, SAMPLE_TYPE)
             print(f"Found {len(samples)} public samples of type {SAMPLE_TYPE}")
 
-            # Parallelize per-sample processing
+            # Process samples in parallel
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = [executor.submit(process_sample, session, compiled_patterns, s) for s in samples]
+                futures = [
+                    executor.submit(process_sample, session, compiled_patterns, s)
+                    for s in samples
+                ]
                 for fut in as_completed(futures):
                     msg, results = fut.result()
                     if msg:
@@ -391,53 +467,56 @@ def main() -> None:
                     if results:
                         all_data.extend(results)
 
-        # Compute a safe sample count for summary
+        # Summary
         if samples is None:
-            try:
-                sample_ids = {str(r.get("sample_id") or "") for r in all_data}
-                samples_count = len([sid for sid in sample_ids if sid])
-            except Exception:
-                samples_count = 0
+            sample_ids = {str(r.get("sample_id") or "") for r in all_data}
+            samples_count = len([sid for sid in sample_ids if sid])
         else:
             samples_count = len(samples)
-        print(f"Fetched {len(all_data)} total data files across {samples_count} samples after filtering")
-        if regex_env.strip():
-            print(f"Filename regex(es): {regex_env}")
-        else:
-            print(f"Filename suffixes: {', '.join(filter_suffixes)}")
-
-        # Save final records to a JSON file
-        output_path = OUTPUT_JSON
-        try:
-            import json
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(all_data, f, ensure_ascii=False, indent=2)
-            print(f"Saved {len(all_data)} records to {output_path}")
-        except Exception as e:
-            print(f"Failed to write output JSON to {output_path}: {e}")
         
-        # Download files concurrently
-        print(f"Starting downloads to '{DATA_DIR}'...")
-        os.makedirs(DATA_DIR, exist_ok=True)
-        success = 0
-        attempted = 0
-        with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
-            futures = [executor.submit(download_file, session, r) for r in all_data]
-            for fut in as_completed(futures):
-                msg, ok = fut.result()
-                attempted += 1
-                if ok:
-                    success += 1
-                # Keep download output minimal; show only failures or every N successes
-                if not ok or (attempted % 25 == 0):
-                    print(msg)
-        print(f"Downloads complete: {success}/{attempted} succeeded")
+        print(f"Fetched {len(all_data)} total data files across {samples_count} samples after filtering")
+        print(f"Filename regex(es): {filename_regex}")
 
-        # Flatten any nested data directories (id/name structures) into DATA_DIR
-        moved, skipped = flatten_data_dir(DATA_DIR)
+        # Save records to JSON
+        try:
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(all_data, f, ensure_ascii=False, indent=2)
+            print(f"Saved {len(all_data)} records to {json_file}")
+        except Exception as e:
+            print(f"Failed to write output JSON to {json_file}: {e}")
+        
+        # Handle SLURM mode or direct download
+        include_sample_id = not args.no_sample_id_prefix
+        
+        if args.slurm:
+            # Generate SLURM job scripts instead of downloading
+            generate_slurm_jobs(all_data, data_dir, args.slurm_dir, include_sample_id)
+        else:
+            # Download files directly
+            print(f"Starting downloads to '{data_dir}'...")
+            os.makedirs(data_dir, exist_ok=True)
+            success = 0
+            attempted = 0
+            
+            with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
+                futures = [
+                    executor.submit(download_file, session, r, data_dir, 
+                                   include_sample_id=include_sample_id)
+                    for r in all_data
+                ]
+                for fut in as_completed(futures):
+                    msg, ok = fut.result()
+                    attempted += 1
+                    if ok:
+                        success += 1
+                    if not ok or (attempted % 25 == 0):
+                        print(msg)
+            
+            print(f"Downloads complete: {success}/{attempted} succeeded")
+
+        # Flatten nested directories
+        moved, skipped = flatten_data_dir(data_dir)
         print(f"Flattened data dir: moved {moved} files, skipped {skipped}")
-
-        # Final summary only (omit individual filenames for brevity)
 
 
 if __name__ == "__main__":
