@@ -150,16 +150,32 @@ Options:
 
 ### `generate_sample_metrics.py`
 
-Generates a CSV with sample metrics from downloaded UMICollapse log files.
+Generates a CSV with sample metrics from downloaded UMICollapse log files and PEKA motif enrichment data.
 
 ```bash
-python generate_sample_metrics.py --output sample_metrics.csv
+python generate_sample_metrics.py --output sample_metrics.csv --peka-dir data_peka
 ```
 
 Output columns:
 - `sample_id` - Flow.bio sample identifier
 - `pcr_duplication_rate` - Ratio of input reads to deduplicated reads  
 - `millions_of_crosslinks` - Number of deduplicated reads / 1,000,000
+- `similarity_score` - Mean overlap ratio of top 50 k-mers vs other samples (see below)
+
+#### Similarity Score
+
+The **similarity score** measures how similar a CLIP dataset's top motifs are compared to all other datasets. It is calculated as follows:
+
+1. For each sample, rank all 5-mers by their PEKA enrichment score and select the **top 50 k-mers**.
+2. For every other sample (excluding samples targeting the **same protein**), calculate the **overlap ratio**: the number of shared k-mers in both top-50 sets, divided by 50.
+3. The similarity score is the **mean** of all pairwise overlap ratios.
+
+**Interpretation:**
+- A score of **0** means the sample's top 50 k-mers were not found in any other dataset's top 50.
+- **Higher scores** indicate that the sample's enriched motifs are commonly enriched across many other datasets (e.g. general RNA-binding motifs).
+- **Lower scores** indicate more unique or protein-specific binding preferences.
+
+Same-protein comparisons are excluded so that similarity reflects cross-protein overlap rather than replicate consistency.
 
 ### `plot_circos.py`
 
@@ -198,7 +214,7 @@ The circos plot applies these quality filters:
 | File | Description |
 |------|-------------|
 | `filtered_data.json` | Sample metadata and file information |
-| `sample_metrics.csv` | Sample ID, PCR duplication rate, crosslink counts |
+| `sample_metrics.csv` | Sample ID, PCR duplication rate, crosslink counts, similarity score |
 | `regional_distribution_circos_motif.png` | Main circos visualization |
 | `pcr_duplication_histogram.png` | PCR duplication ratio distribution |
 | `pcr_duplication_by_target.png` | Box plot by purification target |
@@ -217,8 +233,8 @@ sbatch slurm_logs/submit_array.sh
 # 3. Monitor progress
 squeue -u $USER
 
-# 4. Once complete, generate metrics
-python generate_sample_metrics.py --output sample_metrics.csv
+# 4. Once complete, generate metrics (including similarity scores from PEKA data)
+python generate_sample_metrics.py --output sample_metrics.csv --peka-dir data_peka
 ```
 
 For additional file types:

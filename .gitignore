@@ -14,3 +14,6 @@ scripts/plot_dataset_overview.py
 scripts/plot_sankey.py
 scripts/__pycache__/*
 scripts/peka_multiqc_summary.py
+data*
+.github/copilot-instructions.md
+*log
