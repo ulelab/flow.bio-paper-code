@@ -77,25 +77,62 @@ echo "Downloaded: {dest_path}"
 ''')
         job_files.append(job_script)
     
-    # Create array job script
-    array_script = os.path.join(slurm_dir, "submit_array.sh")
-    with open(array_script, "w") as f:
-        f.write(f'''#!/bin/bash
-#SBATCH --job-name=flow_dl
+    # Create array job scripts (split into batches to respect job limits)
+    max_array = 500
+    n_jobs = len(job_files)
+    n_batches = (n_jobs + max_array - 1) // max_array
+    
+    batch_scripts = []
+    for batch in range(n_batches):
+        start = batch * max_array
+        end = min(start + max_array, n_jobs) - 1
+        batch_script = os.path.join(slurm_dir, f"submit_batch_{batch}.sh")
+        
+        with open(batch_script, "w") as f:
+            f.write(f'''#!/bin/bash
+#SBATCH --job-name=flow_dl_{batch}
 #SBATCH --output={slurm_dir}/logs/array_%A_%a.out
 #SBATCH --error={slurm_dir}/logs/array_%A_%a.err
 #SBATCH --time=00:30:00
 #SBATCH --mem=1G
-#SBATCH --array=0-{len(job_files)-1}%50
+#SBATCH --array=0-{end - start}%50
 
+# Batch {batch + 1}/{n_batches} (jobs {start}-{end})
 cd "$(dirname "$0")"
-JOB_SCRIPT=$(ls dl_*.sh | sed -n "$((SLURM_ARRAY_TASK_ID + 1))p")
+IDX=$(( SLURM_ARRAY_TASK_ID + {start} ))
+JOB_SCRIPT=$(ls dl_*.sh | sed -n "$(( IDX + 1 ))p")
 [ -n "$JOB_SCRIPT" ] && bash "$JOB_SCRIPT"
 ''')
-    os.chmod(array_script, 0o755)
+        os.chmod(batch_script, 0o755)
+        batch_scripts.append(batch_script)
     
-    print(f"Generated {len(job_files)} SLURM job scripts in '{slurm_dir}/'")
-    print(f"Submit with: sbatch {array_script}")
+    # Create wrapper to submit batches with dependencies
+    submit_script = os.path.join(slurm_dir, "submit_all_batches.sh")
+    with open(submit_script, "w") as f:
+        f.write(f'''#!/bin/bash
+# Submit {n_batches} batch(es) of downloads ({n_jobs} total, max {max_array} per batch)
+cd "$(dirname "$0")"
+PREV=""
+''')
+        for i, bs in enumerate(batch_scripts):
+            bs_name = os.path.basename(bs)
+            f.write(f'''echo "Batch {i + 1}/{n_batches}..."
+if [ -z "$PREV" ]; then PREV=$(sbatch --parsable {bs_name})
+else PREV=$(sbatch --parsable --dependency=afterany:$PREV {bs_name}); fi
+echo "  Job: $PREV"
+''')
+        f.write(f'echo "All {n_batches} batch(es) submitted."\n')
+    os.chmod(submit_script, 0o755)
+    
+    if n_batches == 1:
+        import shutil
+        shutil.copy2(batch_scripts[0], os.path.join(slurm_dir, "submit_array.sh"))
+    
+    print(f"Generated {n_jobs} SLURM job scripts in '{slurm_dir}/'")
+    if n_batches > 1:
+        print(f"Split into {n_batches} batches of up to {max_array}. Submit: bash {submit_script}")
+    else:
+        print(f"Submit with: sbatch {os.path.join(slurm_dir, 'submit_array.sh')}")
 
 
 def main():

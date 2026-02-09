@@ -363,38 +363,89 @@ echo "All jobs submitted. Monitor with: squeue -u $USER"
 ''')
     os.chmod(master_script, 0o755)
     
-    # Create array job alternative (more efficient)
-    array_script = os.path.join(slurm_dir, "submit_array.sh")
-    with open(array_script, "w") as f:
-        f.write(f'''#!/bin/bash
-#SBATCH --job-name=flow_download
+    # Create array job scripts (split into batches to respect job limits)
+    max_array = 500  # Safe default below most admin limits
+    n_jobs = len(job_files)
+    n_batches = (n_jobs + max_array - 1) // max_array
+    
+    batch_scripts = []
+    for batch in range(n_batches):
+        start = batch * max_array
+        end = min(start + max_array, n_jobs) - 1
+        batch_script = os.path.join(slurm_dir, f"submit_batch_{batch}.sh")
+        
+        with open(batch_script, "w") as f:
+            f.write(f'''#!/bin/bash
+#SBATCH --job-name=flow_dl_{batch}
 #SBATCH --output={slurm_dir}/logs/array_%A_%a.out
 #SBATCH --error={slurm_dir}/logs/array_%A_%a.err
 #SBATCH --time=00:30:00
 #SBATCH --mem=1G
 #SBATCH --cpus-per-task=1
-#SBATCH --array=0-{len(job_files)-1}%50
+#SBATCH --array=0-{end - start}%50
 
-# Array job for efficient cluster submission
+# Batch {batch + 1}/{n_batches} (jobs {start}-{end})
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Get the job script for this array index
-JOB_SCRIPT=$(ls dl_*.sh | sed -n "$((SLURM_ARRAY_TASK_ID + 1))p")
+IDX=$(( SLURM_ARRAY_TASK_ID + {start} ))
+JOB_SCRIPT=$(ls dl_*.sh | sed -n "$(( IDX + 1 ))p")
 
 if [ -n "$JOB_SCRIPT" ]; then
     bash "$JOB_SCRIPT"
 else
-    echo "No job script found for index $SLURM_ARRAY_TASK_ID"
+    echo "No job script found for index $IDX"
     exit 1
 fi
 ''')
-    os.chmod(array_script, 0o755)
+        os.chmod(batch_script, 0o755)
+        batch_scripts.append(batch_script)
     
-    print(f"Generated {len(job_files)} SLURM job scripts in '{slurm_dir}/'")
+    # Create wrapper script that submits batches with dependencies
+    submit_script = os.path.join(slurm_dir, "submit_all_batches.sh")
+    with open(submit_script, "w") as f:
+        f.write(f'''#!/bin/bash
+# Submit all {n_batches} batch(es) of download jobs
+# Each batch waits for the previous one to complete
+# Total: {n_jobs} downloads in batches of {max_array}
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PREV_JOB=""
+''')
+        for i, bs in enumerate(batch_scripts):
+            bs_name = os.path.basename(bs)
+            f.write(f'''
+echo "Submitting batch {i + 1}/{n_batches}..."
+if [ -z "$PREV_JOB" ]; then
+    PREV_JOB=$(sbatch --parsable {bs_name})
+else
+    PREV_JOB=$(sbatch --parsable --dependency=afterany:$PREV_JOB {bs_name})
+fi
+echo "  Job ID: $PREV_JOB"
+''')
+        f.write(f'''
+echo ""
+echo "All {n_batches} batch(es) submitted. Monitor with: squeue -u $USER"
+''')
+    os.chmod(submit_script, 0o755)
+    
+    # Also keep a single-batch script for small jobs
+    if n_batches == 1:
+        # Symlink for convenience
+        array_script = os.path.join(slurm_dir, "submit_array.sh")
+        import shutil
+        shutil.copy2(batch_scripts[0], array_script)
+    
+    print(f"\nGenerated {n_jobs} SLURM job scripts in '{slurm_dir}/'")
     print(f"Helper script: {helper_script}")
-    print(f"Submit all jobs: bash {master_script}")
-    print(f"Or use array job: sbatch {array_script}")
+    if n_batches > 1:
+        print(f"Split into {n_batches} batches of up to {max_array} jobs each")
+        print(f"Submit all batches: bash {submit_script}")
+    else:
+        print(f"Submit with: sbatch {os.path.join(slurm_dir, 'submit_array.sh')}")
+    print(f"Or submit individual jobs: bash {master_script}")
 
 
 # =============================================================================
