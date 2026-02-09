@@ -82,6 +82,9 @@ echo "Downloaded: {dest_path}"
     n_jobs = len(job_files)
     n_batches = (n_jobs + max_array - 1) // max_array
     
+    abs_slurm_dir = os.path.abspath(slurm_dir)
+    abs_log_dir = os.path.join(abs_slurm_dir, "logs")
+    
     batch_scripts = []
     for batch in range(n_batches):
         start = batch * max_array
@@ -91,14 +94,14 @@ echo "Downloaded: {dest_path}"
         with open(batch_script, "w") as f:
             f.write(f'''#!/bin/bash
 #SBATCH --job-name=flow_dl_{batch}
-#SBATCH --output={slurm_dir}/logs/array_%A_%a.out
-#SBATCH --error={slurm_dir}/logs/array_%A_%a.err
+#SBATCH --output={abs_log_dir}/array_%A_%a.out
+#SBATCH --error={abs_log_dir}/array_%A_%a.err
 #SBATCH --time=00:30:00
 #SBATCH --mem=1G
 #SBATCH --array=0-{end - start}%50
 
 # Batch {batch + 1}/{n_batches} (jobs {start}-{end})
-cd "$(dirname "$0")"
+cd {abs_slurm_dir}
 IDX=$(( SLURM_ARRAY_TASK_ID + {start} ))
 JOB_SCRIPT=$(ls dl_*.sh | sed -n "$(( IDX + 1 ))p")
 [ -n "$JOB_SCRIPT" ] && bash "$JOB_SCRIPT"
@@ -106,21 +109,29 @@ JOB_SCRIPT=$(ls dl_*.sh | sed -n "$(( IDX + 1 ))p")
         os.chmod(batch_script, 0o755)
         batch_scripts.append(batch_script)
     
-    # Create wrapper to submit batches with dependencies
+    # Create wrapper that waits between batches to respect job limits
     submit_script = os.path.join(slurm_dir, "submit_all_batches.sh")
     with open(submit_script, "w") as f:
         f.write(f'''#!/bin/bash
-# Submit {n_batches} batch(es) of downloads ({n_jobs} total, max {max_array} per batch)
-cd "$(dirname "$0")"
-PREV=""
+# Submit {n_batches} batch(es) ({n_jobs} total, max {max_array} per batch)
+# Waits for each batch to finish before submitting the next.
+cd {abs_slurm_dir}
+
+wait_for_job() {{
+    echo "  Waiting for job $1..."
+    while squeue -j "$1" -h 2>/dev/null | grep -q "$1"; do sleep 30; done
+    echo "  Done."
+}}
 ''')
         for i, bs in enumerate(batch_scripts):
             bs_name = os.path.basename(bs)
-            f.write(f'''echo "Batch {i + 1}/{n_batches}..."
-if [ -z "$PREV" ]; then PREV=$(sbatch --parsable {bs_name})
-else PREV=$(sbatch --parsable --dependency=afterany:$PREV {bs_name}); fi
-echo "  Job: $PREV"
+            f.write(f'''echo "=== Batch {i + 1}/{n_batches} ==="
+JOB=$(sbatch --parsable {bs_name})
+if [ -z "$JOB" ]; then echo "ERROR: submit failed"; sleep 60; JOB=$(sbatch --parsable {bs_name}); fi
+echo "  Job: $JOB"
 ''')
+            if i < n_batches - 1:
+                f.write('wait_for_job "$JOB"\n')
         f.write(f'echo "All {n_batches} batch(es) submitted."\n')
     os.chmod(submit_script, 0o755)
     
