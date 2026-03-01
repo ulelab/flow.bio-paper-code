@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Identify samples in filtered_data.json that are missing UMICollapse log files.
+Identify public CLIP samples on Flow.bio that have NO UMICollapse log file,
+i.e. samples that were fetched by download_files.py but never made it into
+filtered_data.json because:
+  - The sample had fewer than 10 data records (pipeline barely ran)
+  - No data record matched the UMICollapse regex (pipeline didn't produce one)
+  - A server error occurred when fetching the sample's data
 
-Compares the sample IDs in filtered_data.json against actual downloaded files
-in the data directory, and produces a summary of missing samples with metadata.
+This script:
+1. Fetches all public CLIP samples from the API
+2. Compares against the sample IDs already in filtered_data.json
+3. For each missing sample, queries the API for data records to diagnose WHY
+4. Outputs a CSV + console summary with project, target, skip reason, etc.
 
 Usage:
     python find_missing_samples.py
-    python find_missing_samples.py --json filtered_data.json --data-dir data --output missing_samples.csv
-
-Also checks SLURM logs (if available) to diagnose download failures.
+    python find_missing_samples.py --output missing_samples.csv --workers 8
 """
 
 import argparse
@@ -18,14 +24,42 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import requests
+except ImportError:
+    print("pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+from flow_api import (
+    load_credentials,
+    get_access_token,
+    get_all_public_samples,
+    get_all_sample_data,
+    filter_samples_by_type,
+    compile_filename_regexes,
+    filter_by_regex,
+)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+BASE_URL = "https://api.flow.bio"
+SAMPLE_TYPE = "CLIP"
+UMICOLLAPSE_REGEX = r"(.*unique_genome.dedup_UMICollapse.log)"
+MIN_DATA_RECORDS = 10  # same threshold as download_files.py
+CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "credentials.json")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Find samples missing UMICollapse log files"
+        description="Find public CLIP samples that have no UMICollapse log on Flow.bio"
     )
     parser.add_argument(
         "--json", "-j",
@@ -33,318 +67,317 @@ def parse_args():
         help="Path to filtered_data.json (default: filtered_data.json)"
     )
     parser.add_argument(
-        "--data-dir", "-d",
-        default="data",
-        help="Directory containing downloaded UMICollapse logs (default: data)"
-    )
-    parser.add_argument(
-        "--slurm-dir", "-s",
-        default=None,
-        help="SLURM logs directory to check for error messages (optional)"
-    )
-    parser.add_argument(
         "--output", "-o",
         default="missing_samples.csv",
         help="Output CSV file (default: missing_samples.csv)"
     )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int, default=8,
+        help="Parallel workers for API queries (default: 8)"
+    )
     return parser.parse_args()
 
 
-def extract_sample_id_from_filename(filename: str) -> Optional[str]:
-    """Extract sample_id prefix from a downloaded file."""
-    parts = filename.split('_', 1)
-    if len(parts) > 1 and parts[0].isdigit():
-        return parts[0]
-    return None
+# =============================================================================
+# Helpers to extract fields from the public sample object
+# =============================================================================
+
+def get_sample_id(sample: Dict) -> str:
+    return str(
+        sample.get("id")
+        or sample.get("sample_id")
+        or sample.get("uid")
+        or sample.get("uuid")
+        or ""
+    ).strip()
 
 
-def get_downloaded_sample_ids(data_dir: str) -> Set[str]:
-    """Scan the data directory and return the set of sample IDs with files."""
-    sample_ids = set()
-    if not os.path.isdir(data_dir):
-        print(f"Warning: data directory '{data_dir}' not found", file=sys.stderr)
-        return sample_ids
-    
-    for fname in os.listdir(data_dir):
-        sid = extract_sample_id_from_filename(fname)
-        if sid:
-            sample_ids.add(sid)
-    return sample_ids
+def get_sample_name(sample: Dict) -> str:
+    return str(sample.get("name") or "")
 
 
-def extract_metadata_field(record: Dict, *keys) -> str:
-    """Safely extract a nested metadata field, returning '' if missing."""
-    metadata = record.get("sample_metadata", {}) or {}
-    
-    for key in keys:
-        val = metadata.get(key)
-        if val is not None:
-            if isinstance(val, dict):
-                return str(val.get("name") or val.get("identifier") or val.get("value") or val)
-            return str(val)
-    return ""
+def get_project(sample: Dict) -> Tuple[str, str]:
+    """Return (project_name, project_id) from a public sample object."""
+    proj = sample.get("project") or {}
+    if isinstance(proj, dict):
+        return (str(proj.get("name") or ""), str(proj.get("id") or ""))
+    return ("", "")
 
 
-def extract_purification_target(record: Dict) -> str:
-    """Extract purification target from nested metadata structure."""
-    metadata = record.get("sample_metadata", {}) or {}
-    
-    # Try metadata.metadata.purification_target.value (enriched format)
-    inner = metadata.get("metadata", {}) or {}
-    if isinstance(inner, dict):
-        pt = inner.get("purification_target", {})
+def get_organism(sample: Dict) -> str:
+    org = sample.get("organism") or {}
+    if isinstance(org, dict):
+        return str(org.get("name") or org.get("id") or "")
+    return str(org) if org else ""
+
+
+def get_purification_target(sample: Dict) -> str:
+    """Extract purification target from sample metadata."""
+    meta = sample.get("metadata") or {}
+    if isinstance(meta, dict):
+        pt = meta.get("purification_target") or {}
         if isinstance(pt, dict):
             val = pt.get("value") or pt.get("name") or ""
             if val:
-                return str(val).upper()
+                target = str(val).upper()
+                return "TARDBP" if target == "TDP43" else target
         elif pt:
-            return str(pt).upper()
-    
-    # Try top-level purification_target
-    pt = metadata.get("purification_target")
-    if pt:
-        if isinstance(pt, dict):
-            return str(pt.get("value") or pt.get("name") or "").upper()
-        return str(pt).upper()
-    
+            target = str(pt).upper()
+            return "TARDBP" if target == "TDP43" else target
     return ""
 
 
-def check_slurm_logs(slurm_dir: str, sample_ids: Set[str]) -> Dict[str, str]:
-    """
-    Check SLURM log files for error messages related to missing samples.
-    Returns dict mapping sample_id -> error summary.
-    """
-    errors: Dict[str, str] = {}
-    if not slurm_dir or not os.path.isdir(slurm_dir):
-        return errors
-    
-    logs_dir = os.path.join(slurm_dir, "logs")
-    if not os.path.isdir(logs_dir):
-        logs_dir = slurm_dir
-    
-    # Also check the job scripts to map job index -> sample_id
-    job_sample_map: Dict[str, str] = {}  # job_index -> sample_id
-    
-    for fname in sorted(os.listdir(slurm_dir)):
-        if not fname.endswith('.sh') or not fname.startswith('dl_'):
-            continue
-        job_path = os.path.join(slurm_dir, fname)
-        try:
-            with open(job_path, 'r') as f:
-                content = f.read()
-            # Extract sample_id from the dest path in the script
-            match = re.search(r'--dest\s+"[^"]*?/(\d+)_', content)
-            if match:
-                job_idx = fname.replace('dl_', '').replace('.sh', '')
-                job_sample_map[job_idx] = match.group(1)
-        except Exception:
-            pass
-    
-    # Check stderr logs for errors
-    if os.path.isdir(logs_dir):
-        for fname in os.listdir(logs_dir):
-            if not fname.endswith('.err'):
-                continue
-            log_path = os.path.join(logs_dir, fname)
-            try:
-                with open(log_path, 'r') as f:
-                    content = f.read().strip()
-                if not content:
-                    continue
-                
-                # Try to find which sample this log belongs to
-                # Array logs: array_JOBID_INDEX.err
-                match = re.search(r'_(\d+)\.err$', fname)
-                if match:
-                    idx = match.group(1).zfill(5)
-                    sid = job_sample_map.get(idx)
-                    if sid and sid in sample_ids:
-                        # Summarize the error (first meaningful line)
-                        err_lines = [l.strip() for l in content.split('\n') if l.strip()]
-                        error_summary = err_lines[-1] if err_lines else "Unknown error"
-                        errors[sid] = error_summary[:200]
-            except Exception:
-                pass
-    
-    return errors
+def get_experimental_method(sample: Dict) -> str:
+    meta = sample.get("metadata") or {}
+    if isinstance(meta, dict):
+        em = meta.get("experimental_method") or {}
+        if isinstance(em, dict):
+            return str(em.get("value") or em.get("name") or "")
+        return str(em) if em else ""
+    return ""
 
 
-def categorize_failure(record: Dict, slurm_error: str = "") -> str:
-    """Try to categorize why a sample might be missing its file."""
-    reasons = []
-    
-    file_obj = record.get("file", {})
-    if not file_obj:
-        reasons.append("no_file_record")
-    
-    data_id = str(file_obj.get("id") or "").strip() if file_obj else ""
-    if not data_id:
-        reasons.append("no_data_id")
-    
-    filename = str(file_obj.get("filename") or file_obj.get("name") or "").strip() if file_obj else ""
-    if not filename:
-        reasons.append("no_filename")
-    
-    if slurm_error:
-        if "HTTP 404" in slurm_error or "Not Found" in slurm_error:
-            reasons.append("file_not_found_404")
-        elif "HTTP 403" in slurm_error or "Forbidden" in slurm_error:
-            reasons.append("access_denied_403")
-        elif "HTTP 5" in slurm_error:
-            reasons.append("server_error_5xx")
-        elif "Failed" in slurm_error:
-            reasons.append("download_failed")
-        elif "timeout" in slurm_error.lower():
-            reasons.append("timeout")
+def get_owner(sample: Dict) -> str:
+    owner = sample.get("owner") or {}
+    if isinstance(owner, dict):
+        return str(owner.get("name") or owner.get("username") or "")
+    return ""
+
+
+# =============================================================================
+# Diagnose why a sample has no UMICollapse log
+# =============================================================================
+
+def diagnose_sample(
+    session: requests.Session,
+    sample_id: str,
+    compiled_patterns: List,
+) -> Tuple[str, int, List[str]]:
+    """
+    Query the API for a sample's data records and figure out why there's
+    no UMICollapse log.
+
+    Returns:
+        (reason, total_data_count, list_of_pipeline_names)
+    """
+    try:
+        data_items = get_all_sample_data(session, sample_id)
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        if status and 500 <= status < 600:
+            return (f"server_error_{status}", 0, [])
+        return (f"http_error_{status}", 0, [])
+    except Exception as e:
+        return (f"error: {str(e)[:80]}", 0, [])
+
+    total_count = len(data_items)
+
+    # Collect pipeline names for context
+    pipelines = set()
+    for item in data_items:
+        pn = item.get("pipeline_name") or ""
+        if pn:
+            pipelines.add(pn)
+
+    if total_count == 0:
+        return ("no_data_records", total_count, sorted(pipelines))
+
+    if total_count < MIN_DATA_RECORDS:
+        return (f"too_few_data_records ({total_count}<{MIN_DATA_RECORDS})", total_count, sorted(pipelines))
+
+    # Check if any match the UMICollapse regex
+    matches = filter_by_regex(data_items, compiled_patterns)
+    if not matches:
+        # Check what files DO exist to give context
+        filenames = [
+            (item.get("filename") or item.get("name") or "")
+            for item in data_items
+        ]
+        # Look for partial pipeline completion clues
+        has_dedup = any("dedup" in f.lower() for f in filenames)
+        has_clip = any("clip" in f.lower() or "unique_genome" in f.lower() for f in filenames)
+
+        if has_dedup and not has_clip:
+            return ("pipeline_incomplete (has dedup files but no UMICollapse)", total_count, sorted(pipelines))
+        elif not has_dedup and not has_clip:
+            return ("no_clip_pipeline_output", total_count, sorted(pipelines))
         else:
-            reasons.append(f"slurm_error")
-    
-    if not reasons:
-        reasons.append("unknown")
-    
-    return "; ".join(reasons)
+            return ("no_umicollapse_log (has other CLIP output)", total_count, sorted(pipelines))
 
+    # This shouldn't happen if the sample truly isn't in filtered_data.json
+    return (f"has_umicollapse_log ({len(matches)} found - check filtered_data.json)", total_count, sorted(pipelines))
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
     args = parse_args()
-    
-    # --- Load filtered_data.json ---
+
+    # --- Load filtered_data.json to get sample IDs already processed ---
     if not os.path.exists(args.json):
         print(f"Error: {args.json} not found", file=sys.stderr)
         sys.exit(1)
-    
+
     with open(args.json, 'r', encoding='utf-8') as f:
-        all_records = json.load(f)
-    
-    if not isinstance(all_records, list):
-        print(f"Error: expected list in {args.json}", file=sys.stderr)
-        sys.exit(1)
-    
-    # Build map: sample_id -> record (keep last if duplicates)
-    records_by_sample: Dict[str, Dict] = {}
-    for record in all_records:
+        existing_records = json.load(f)
+
+    existing_ids: Set[str] = set()
+    for record in existing_records:
         sid = str(record.get("sample_id") or "").strip()
         if sid:
-            records_by_sample[sid] = record
-    
-    all_sample_ids = set(records_by_sample.keys())
-    print(f"Total samples in {args.json}: {len(all_sample_ids)}")
-    
-    # --- Scan downloaded files ---
-    downloaded_ids = get_downloaded_sample_ids(args.data_dir)
-    print(f"Samples with files in {args.data_dir}/: {len(downloaded_ids)}")
-    
-    # --- Find missing ---
-    missing_ids = all_sample_ids - downloaded_ids
-    extra_ids = downloaded_ids - all_sample_ids  # files not in JSON (shouldn't happen)
-    
-    print(f"\nMissing samples (in JSON but no file): {len(missing_ids)}")
-    if extra_ids:
-        print(f"Extra files (in dir but not in JSON): {len(extra_ids)}")
-    
-    if not missing_ids:
-        print("\nAll samples have downloaded files. Nothing to investigate.")
-        return
-    
-    # --- Check SLURM logs if available ---
-    slurm_errors: Dict[str, str] = {}
-    if args.slurm_dir:
-        slurm_errors = check_slurm_logs(args.slurm_dir, missing_ids)
-        if slurm_errors:
-            print(f"Found SLURM error logs for {len(slurm_errors)} missing samples")
-    
+            existing_ids.add(sid)
+
+    print(f"Samples in {args.json}: {len(existing_ids)}")
+
+    # --- Authenticate and fetch all public CLIP samples ---
+    username, password = load_credentials(CREDENTIALS_PATH)
+    access_token = get_access_token(username, password)
+    print("Authenticated successfully")
+
+    with requests.Session() as session:
+        session.headers.update({"Authorization": f"Bearer {access_token}"})
+
+        print("Fetching all public CLIP samples...")
+        all_samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
+        all_samples = filter_samples_by_type(all_samples, SAMPLE_TYPE)
+        print(f"Total public CLIP samples: {len(all_samples)}")
+
+        # --- Build lookup of public samples and find which are missing ---
+        public_by_id: Dict[str, Dict] = {}
+        for s in all_samples:
+            sid = get_sample_id(s)
+            if sid:
+                public_by_id[sid] = s
+
+        missing_ids = set(public_by_id.keys()) - existing_ids
+        print(f"\nSamples WITHOUT UMICollapse log: {len(missing_ids)}")
+        print(f"Samples WITH UMICollapse log:    {len(existing_ids)}")
+
+        if not missing_ids:
+            print("\nAll public samples have UMICollapse logs. Nothing missing.")
+            return
+
+        # --- Diagnose each missing sample (parallel API calls) ---
+        print(f"\nDiagnosing {len(missing_ids)} missing samples (querying API for data records)...")
+        compiled_patterns = compile_filename_regexes(UMICOLLAPSE_REGEX)
+
+        diagnoses: Dict[str, Tuple[str, int, List[str]]] = {}
+        done = 0
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(diagnose_sample, session, sid, compiled_patterns): sid
+                for sid in missing_ids
+            }
+            for fut in as_completed(futures):
+                sid = futures[fut]
+                try:
+                    reason, count, pipelines = fut.result()
+                    diagnoses[sid] = (reason, count, pipelines)
+                except Exception as e:
+                    diagnoses[sid] = (f"exception: {str(e)[:80]}", 0, [])
+                done += 1
+                if done % 50 == 0:
+                    print(f"  Diagnosed {done}/{len(missing_ids)}...")
+
+        print(f"  Diagnosed {done}/{len(missing_ids)} samples")
+
     # --- Build output rows ---
     rows = []
-    for sid in sorted(missing_ids, key=int):
-        record = records_by_sample[sid]
-        target = extract_purification_target(record)
-        if target == "TDP43":
-            target = "TARDBP"
-        
-        sample_name = record.get("sample_name", "")
-        organism = extract_metadata_field(record, "organism")
-        method = extract_metadata_field(record, "sample_method")
-        
-        file_obj = record.get("file", {}) or {}
-        filename = file_obj.get("filename") or file_obj.get("name") or ""
-        data_id = file_obj.get("id") or ""
-        
-        slurm_err = slurm_errors.get(sid, "")
-        reason = categorize_failure(record, slurm_err)
-        
+    for sid in sorted(missing_ids):
+        sample = public_by_id[sid]
+        reason, data_count, pipelines = diagnoses.get(sid, ("unknown", 0, []))
+
+        target = get_purification_target(sample)
+        project_name, project_id = get_project(sample)
+
         rows.append({
             "sample_id": sid,
-            "sample_name": sample_name,
+            "sample_name": get_sample_name(sample),
             "purification_target": target,
-            "organism": organism,
-            "method": method,
-            "expected_filename": filename,
-            "data_id": data_id,
-            "failure_reason": reason,
-            "slurm_error": slurm_err,
+            "project_name": project_name,
+            "project_id": project_id,
+            "organism": get_organism(sample),
+            "method": get_experimental_method(sample),
+            "owner": get_owner(sample),
+            "data_record_count": data_count,
+            "pipelines": "; ".join(pipelines),
+            "skip_reason": reason,
             "flow_url": f"https://app.flow.bio/samples/{sid}",
         })
-    
+
+    # Sort by skip reason then sample name for readability
+    rows.sort(key=lambda r: (r["skip_reason"], r["sample_name"]))
+
     # --- Write CSV ---
     fieldnames = [
-        "sample_id", "sample_name", "purification_target", "organism",
-        "method", "expected_filename", "data_id", "failure_reason",
-        "slurm_error", "flow_url",
+        "sample_id", "sample_name", "purification_target",
+        "project_name", "project_id", "organism", "method", "owner",
+        "data_record_count", "pipelines", "skip_reason", "flow_url",
     ]
-    
+
     with open(args.output, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    
+
     print(f"\nWrote {len(rows)} missing samples to {args.output}")
-    
+
     # --- Console Summary ---
     print(f"\n{'='*70}")
     print("MISSING SAMPLES SUMMARY")
     print(f"{'='*70}")
-    
-    # By failure reason
-    reason_counts = Counter(r["failure_reason"] for r in rows)
-    print(f"\nBy failure reason:")
+    print(f"\nTotal public CLIP samples: {len(public_by_id)}")
+    print(f"Have UMICollapse log:      {len(existing_ids)}")
+    print(f"Missing UMICollapse log:   {len(rows)}")
+
+    # By skip reason
+    reason_counts = Counter(r["skip_reason"] for r in rows)
+    print(f"\nBy skip reason:")
     for reason, count in reason_counts.most_common():
         print(f"  {reason}: {count}")
-    
+
+    # By project
+    project_counts = Counter(r["project_name"] or "UNKNOWN" for r in rows)
+    print(f"\nBy project ({len(project_counts)} unique):")
+    for proj, count in project_counts.most_common():
+        print(f"  {proj}: {count}")
+
     # By purification target
     target_counts = Counter(r["purification_target"] or "UNKNOWN" for r in rows)
     print(f"\nBy purification target ({len(target_counts)} unique):")
     for target, count in target_counts.most_common(20):
         print(f"  {target}: {count}")
     if len(target_counts) > 20:
-        print(f"  ... and {len(target_counts) - 20} more")
-    
+        remaining = len(target_counts) - 20
+        print(f"  ... and {remaining} more")
+
     # By organism
     org_counts = Counter(r["organism"] or "UNKNOWN" for r in rows)
-    if org_counts:
-        print(f"\nBy organism:")
-        for org, count in org_counts.most_common():
-            print(f"  {org}: {count}")
-    
-    # By method
-    method_counts = Counter(r["method"] or "UNKNOWN" for r in rows)
-    if method_counts:
-        print(f"\nBy experimental method:")
-        for method, count in method_counts.most_common():
-            print(f"  {method}: {count}")
-    
+    print(f"\nBy organism:")
+    for org, count in org_counts.most_common():
+        print(f"  {org}: {count}")
+
+    # By owner
+    owner_counts = Counter(r["owner"] or "UNKNOWN" for r in rows)
+    print(f"\nBy owner:")
+    for owner, count in owner_counts.most_common():
+        print(f"  {owner}: {count}")
+
     # List first few
     print(f"\nFirst 20 missing samples:")
-    print(f"  {'Sample ID':<12} {'Target':<15} {'Name':<30} {'Reason'}")
-    print(f"  {'-'*10:<12} {'-'*13:<15} {'-'*28:<30} {'-'*20}")
+    print(f"  {'Sample ID':<22} {'Target':<12} {'Project':<22} {'Reason'}")
+    print(f"  {'-'*20:<22} {'-'*10:<12} {'-'*20:<22} {'-'*30}")
     for r in rows[:20]:
-        print(f"  {r['sample_id']:<12} {r['purification_target'] or 'N/A':<15} "
-              f"{r['sample_name'][:28]:<30} {r['failure_reason']}")
+        print(f"  {r['sample_id']:<22} {r['purification_target'] or 'N/A':<12} "
+              f"{(r['project_name'] or 'N/A')[:20]:<22} {r['skip_reason']}")
     if len(rows) > 20:
         print(f"  ... and {len(rows) - 20} more (see {args.output})")
-    
+
     print(f"\nFull details: {args.output}")
-    print(f"View on Flow.bio: https://app.flow.bio/samples/{{sample_id}}")
 
 
 if __name__ == "__main__":
