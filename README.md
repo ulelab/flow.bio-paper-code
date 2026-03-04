@@ -157,22 +157,24 @@ Options:
   --slurm        Generate SLURM job scripts instead of downloading
   --slurm-dir    Directory for SLURM job scripts (default: slurm_jobs)
   --no-sample-id-prefix  Don't prefix filenames with sample_id
+  --pipeline     Only keep data records from this pipeline (e.g. 'hanalysis clipseq').
+                 Case-insensitive substring match.
 ```
 
 ### `download_data_objects.py`
 
-Downloads data objects directly by `process_execution_name` from the `/data/search` API. Unlike the sample-based scripts, this finds data objects produced by a specific pipeline process — including multi-sample integration outputs (e.g. TEtranscripts) that may not be linked to individual samples.
+Downloads data objects produced by a specific pipeline process within a project. This handles multi-sample integration outputs (e.g. TETRANSCRIPTS) that aren't linked to individual samples.
 
-**Deduplication**: when the same sample has multiple runs of a process, multiple outputs with the same filename exist. By default, only the most recent per `(sample_id, filename)` is kept.
+It works by navigating: **project → executions → process steps → downstream_data**.
+
+**File naming**: output filenames are prefixed with their execution ID and date (`{execution_id}_{YYYY-MM-DD}_{filename}`) since each execution produces identically-named files (e.g. `control.cntTable`). This ensures outputs from different executions don't overwrite each other and makes it easy to identify when each execution was run.
 
 ```
 Options:
-  --process, -p        process_execution_name to search for (required)
-  --filename, -f       Server-side filename substring filter (optional)
-  --regex, -r          Local regex to further filter filenames (optional)
+  --project            Project ID to search within (required)
+  --process, -p        Process name substring to match (required, e.g. TETRANSCRIPTS)
+  --regex, -r          Regex to further filter output filenames (optional)
   --dir, -d            Output directory (required)
-  --keep-all           Keep all versions (skip deduplication)
-  --no-sample-id-prefix  Don't prefix filenames with sample_id
   --slurm              Generate SLURM job scripts instead of downloading
   --slurm-dir          Directory for SLURM job scripts (default: slurm_jobs)
   --workers, -w        Parallel download workers (default: 4)
@@ -180,17 +182,24 @@ Options:
 ```
 
 ```bash
-# Download all TETRANSCRIPTS outputs
-python download_data_objects.py --process TETRANSCRIPTS --dir data_te
+# Download all TETRANSCRIPTS outputs from the RBP ENCODE Data project
+python download_data_objects.py \
+    --project 523943332699993118 \
+    --process TETRANSCRIPTS \
+    --dir data_te
 
-# Filter by filename too
-python download_data_objects.py --process TETRANSCRIPTS --filename counts --dir data_te
-
-# Keep all versions (no dedup)
-python download_data_objects.py --process TETRANSCRIPTS --dir data_te --keep-all
+# Filter by filename pattern
+python download_data_objects.py \
+    --project 523943332699993118 \
+    --process TETRANSCRIPTS \
+    --regex ".*\.cntTable" \
+    --dir data_te
 
 # SLURM mode
-python download_data_objects.py --process TETRANSCRIPTS --dir data_te --slurm
+python download_data_objects.py \
+    --project 523943332699993118 \
+    --process TETRANSCRIPTS \
+    --dir data_te --slurm
 ```
 
 ### `generate_sample_metrics.py`

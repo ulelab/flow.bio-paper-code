@@ -1,37 +1,46 @@
 #!/usr/bin/env python3
 """
-Download data objects directly from the Flow.bio /data/search API.
+Download data objects produced by a specific pipeline process from Flow.bio.
 
-Unlike download_files.py (which iterates samples), this script searches for
-data objects by process_execution_name and/or filename pattern. This is useful
-for downloading outputs from multi-sample integration processes (e.g.
-TETRANSCRIPTS) that may not be directly linked to individual samples.
+This script finds outputs from multi-sample integration processes like
+TETRANSCRIPTS by navigating:
+  project → executions → process_executions → downstream_data
 
-Deduplication: when the same sample has been run through a process multiple
-times, multiple data objects with the same filename will exist. By default,
-only the most recently created object per (sample_id, filename) pair is kept.
+This is the right approach for data objects that aren't linked to individual
+samples but are produced as part of a pipeline execution within a project.
+
+Output filenames are prefixed with their execution ID to avoid collisions,
+since each execution produces identically-named files.
 
 Usage:
-    # Download all TETRANSCRIPTS outputs
-    python download_data_objects.py --process TETRANSCRIPTS --dir data_te
+    # Download all TETRANSCRIPTS outputs from the RBP ENCODE Data project
+    python download_data_objects.py \\
+        --project 523943332699993118 \\
+        --process TETRANSCRIPTS \\
+        --dir data_te
 
-    # Also filter by filename pattern
-    python download_data_objects.py --process TETRANSCRIPTS --filename "counts" --dir data_te
+    # Filter by filename pattern
+    python download_data_objects.py \\
+        --project 523943332699993118 \\
+        --process TETRANSCRIPTS \\
+        --regex ".*\\.cntTable" \\
+        --dir data_te
 
-    # Generate SLURM jobs instead of downloading directly
-    python download_data_objects.py --process TETRANSCRIPTS --dir data_te --slurm
-
-    # Keep all versions (skip deduplication)
-    python download_data_objects.py --process TETRANSCRIPTS --dir data_te --keep-all
+    # SLURM mode
+    python download_data_objects.py \\
+        --project 523943332699993118 \\
+        --process TETRANSCRIPTS \\
+        --dir data_te --slurm
 """
 
 import argparse
 import os
 import sys
 import json
-import time
 import re
+import time
 from typing import Dict, List, Any, Tuple
+from datetime import datetime, timezone
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -56,148 +65,151 @@ REQUEST_DELAY_SEC = 0.1
 
 # ── Pagination ──────────────────────────────────────────────────────────────
 
-def paginate_items(session, url, params=None):
-    """Paginate through API results."""
+def paginate_items(session, url, params=None, items_key=None):
+    """Paginate through API results with progress logging."""
     params = dict(params or {})
     page = 1
+    total_yielded = 0
     per_page = params.pop("count", PER_PAGE)
     while True:
-        resp = session.get(url, params={**params, "page": page, "count": per_page}, timeout=60)
+        resp = session.get(url, params={**params, "page": page, "count": per_page}, timeout=120)
         resp.raise_for_status()
         data = resp.json()
-        items = (
-            data.get("items")
-            or data.get("results")
-            or data.get("data")
-            or data.get("samples")
-            or []
-        )
+        if items_key and items_key in data:
+            items = data[items_key]
+        else:
+            items = (
+                data.get("items")
+                or data.get("results")
+                or data.get("data")
+                or data.get("executions")
+                or data.get("samples")
+                or []
+            )
         if not items:
             break
         yield from items
+        total_yielded += len(items)
+        if page % 5 == 0:
+            print(f"  ... fetched {total_yielded} items (page {page})")
         page += 1
         if REQUEST_DELAY_SEC:
             time.sleep(REQUEST_DELAY_SEC)
 
 
-# ── Data search ─────────────────────────────────────────────────────────────
+# ── Core: find process outputs via project executions ───────────────────────
 
-def search_data_objects(session, process_name=None, filename=None):
-    """Search /data/search with optional filters."""
-    params = {}
-    if process_name:
-        params["process_execution_name"] = process_name
-    if filename:
-        params["filename"] = filename
-    items = list(paginate_items(session, f"{BASE_URL}/data/search", params))
-    return items
-
-
-# ── Timestamp parsing ───────────────────────────────────────────────────────
-
-def _to_timestamp(value):
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            from datetime import datetime
-            if value.endswith("Z"):
-                value = value.replace("Z", "+00:00")
-            return datetime.fromisoformat(value).timestamp()
-        except Exception:
-            return 0.0
-    return 0.0
-
-
-# ── Deduplication ───────────────────────────────────────────────────────────
-
-def dedupe_by_sample_and_filename(items):
-    """Keep only the most recently created item per (sample_id, filename).
-
-    If a data object has no sample linkage, sample_id is treated as empty
-    so all such objects are deduped by filename alone.
+def find_process_outputs(session, project_id, process_name_filter):
     """
-    best = {}      # (sample_id, filename) -> item
-    best_ts = {}   # (sample_id, filename) -> timestamp
+    Find all data objects produced by a specific process across all executions
+    in a project.
 
-    for item in items:
-        fname = item.get("filename") or item.get("name") or ""
-        if not fname:
+    Path: /projects/{id}/executions → /executions/{id} → process_executions
+          → filter by process_name → downstream_data
+    """
+    process_filter_lower = process_name_filter.lower()
+
+    # 1. List all executions in the project
+    print(f"Listing executions for project {project_id}...")
+    executions = list(paginate_items(
+        session,
+        f"{BASE_URL}/projects/{project_id}/executions",
+        items_key="executions",
+    ))
+    print(f"Found {len(executions)} executions")
+
+    # 2. For each execution, fetch details and find matching process steps
+    all_outputs = []
+    for i, ex_summary in enumerate(executions, 1):
+        exec_id = ex_summary.get("id")
+        if not exec_id:
             continue
 
-        # Extract sample linkage
-        sample = item.get("sample") or {}
-        sample_id = str(
-            item.get("sample_id")
-            or (sample.get("id") if isinstance(sample, dict) else "")
-            or ""
-        ).strip()
+        if i % 10 == 0 or i == 1:
+            print(f"  Checking execution {i}/{len(executions)} (id={exec_id})...")
 
-        ts = _to_timestamp(
-            item.get("created") or item.get("created_at") or item.get("timestamp")
-        )
-
-        key = (sample_id, fname)
-        if ts >= best_ts.get(key, -1.0):
-            best_ts[key] = ts
-            best[key] = item
-
-    return list(best.values())
-
-
-def dedupe_by_filename_only(items):
-    """Keep only the most recently created item per filename (ignoring sample)."""
-    best = {}
-    best_ts = {}
-    for item in items:
-        fname = item.get("filename") or item.get("name") or ""
-        if not fname:
+        try:
+            resp = session.get(f"{BASE_URL}/executions/{exec_id}", timeout=120)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status and 500 <= status < 600:
+                print(f"  Skipping execution {exec_id}: server error {status}")
+                continue
+            raise
+        except requests.exceptions.RequestException as e:
+            print(f"  Skipping execution {exec_id}: {e}")
             continue
-        ts = _to_timestamp(
-            item.get("created") or item.get("created_at") or item.get("timestamp")
-        )
-        if ts >= best_ts.get(fname, -1.0):
-            best_ts[fname] = ts
-            best[fname] = item
-    return list(best.values())
+
+        edata = resp.json()
+        proc_execs = edata.get("process_executions") or []
+
+        for proc in proc_execs:
+            proc_name = proc.get("process_name") or proc.get("name") or ""
+            if process_filter_lower not in proc_name.lower():
+                continue
+
+            downstream = proc.get("downstream_data") or []
+            for data_obj in downstream:
+                # Attach execution context for traceability
+                data_obj["_execution_id"] = exec_id
+                data_obj["_execution_created"] = ex_summary.get("created")
+                data_obj["_execution_pipeline"] = ex_summary.get("pipeline_name", "")
+                data_obj["_process_name"] = proc_name
+                all_outputs.append(data_obj)
+
+        if REQUEST_DELAY_SEC:
+            time.sleep(REQUEST_DELAY_SEC)
+
+    return all_outputs
 
 
 # ── Record formatting ──────────────────────────────────────────────────────
 
-def format_records(items, include_sample_id=True):
-    """Convert raw data objects into download records compatible with flow_api.download_file."""
+def format_records(items):
+    """Convert data objects into download records compatible with flow_api.download_file.
+
+    Filenames are prefixed with execution ID and date for uniqueness and
+    traceability: {execution_id}_{YYYY-MM-DD}_{filename}
+    """
     records = []
     for item in items:
         data_id = str(item.get("id") or "").strip()
-        filename = str(item.get("filename") or item.get("name") or "").strip()
+        filename = str(item.get("filename") or "").strip()
+        exec_id = str(item.get("_execution_id") or "").strip()
         if not data_id or not filename:
             continue
-
-        sample = item.get("sample") or {}
-        sample_id = str(
-            item.get("sample_id")
-            or (sample.get("id") if isinstance(sample, dict) else "")
-            or ""
-        ).strip()
-
+        # Build date string from execution created timestamp
+        date_str = ""
+        exec_created = item.get("_execution_created")
+        if exec_created and isinstance(exec_created, (int, float)):
+            try:
+                date_str = datetime.fromtimestamp(exec_created, tz=timezone.utc).strftime("%Y-%m-%d")
+            except (OSError, ValueError):
+                pass
+        # Prefix with execution ID and date for uniqueness
+        if exec_id and date_str:
+            prefixed_filename = f"{exec_id}_{date_str}_{filename}"
+        elif exec_id:
+            prefixed_filename = f"{exec_id}_{filename}"
+        else:
+            prefixed_filename = filename
         records.append({
-            "sample_id": sample_id,
-            "sample_name": sample.get("name", "") if isinstance(sample, dict) else "",
+            "sample_id": "",  # these are standalone objects
+            "sample_name": "",
             "file": {
                 "id": data_id,
-                "filename": filename,
-                "pipeline_name": item.get("pipeline_name", ""),
-                "process_execution_name": item.get("process_execution_name", ""),
+                "filename": prefixed_filename,
             },
+            "_execution_id": exec_id,
+            "_process_name": item.get("_process_name", ""),
         })
     return records
 
 
 # ── SLURM generation ───────────────────────────────────────────────────────
 
-def generate_slurm_jobs(records, data_dir, slurm_dir, include_sample_id=True):
+def generate_slurm_jobs(records, data_dir, slurm_dir):
     """Generate SLURM job scripts for downloading data objects."""
     os.makedirs(slurm_dir, exist_ok=True)
     os.makedirs(os.path.join(slurm_dir, "logs"), exist_ok=True)
@@ -205,18 +217,12 @@ def generate_slurm_jobs(records, data_dir, slurm_dir, include_sample_id=True):
     job_files = []
     for i, record in enumerate(records):
         file_obj = record.get("file", {})
-        sample_id = str(record.get("sample_id") or "").strip()
         data_id = str(file_obj.get("id") or "").strip()
-        original_filename = str(file_obj.get("filename") or "").strip()
-        if not data_id or not original_filename:
+        filename = str(file_obj.get("filename") or "").strip()  # already prefixed with exec id
+        if not data_id or not filename:
             continue
 
-        if include_sample_id and sample_id:
-            filename = f"{sample_id}_{os.path.basename(original_filename)}"
-        else:
-            filename = os.path.basename(original_filename)
-
-        url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(original_filename)}"
+        url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(filename)}"
         dest_path = os.path.join(os.path.abspath(data_dir), filename)
 
         job_name = f"dl_{i:05d}"
@@ -235,7 +241,6 @@ echo "Downloaded: {filename}"
 """)
         job_files.append(job_script)
 
-    # Array job script
     n_jobs = len(job_files)
     if n_jobs == 0:
         print("No jobs to generate.")
@@ -257,7 +262,6 @@ JOB_SCRIPT=$(ls dl_*.sh | sed -n "$(( SLURM_ARRAY_TASK_ID + 1 ))p")
 [ -n "$JOB_SCRIPT" ] && bash "$JOB_SCRIPT"
 """)
     os.chmod(submit_script, 0o755)
-
     print(f"Generated {n_jobs} SLURM job scripts in '{slurm_dir}/'")
     print(f"Submit with: sbatch {submit_script}")
 
@@ -266,49 +270,44 @@ JOB_SCRIPT=$(ls dl_*.sh | sed -n "$(( SLURM_ARRAY_TASK_ID + 1 ))p")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Download data objects from Flow.bio by process execution name",
+        description="Download data objects from a Flow.bio project by process name",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+How it works:
+  1. Lists all pipeline executions in the project
+  2. For each execution, finds process steps matching --process
+  3. Collects their downstream_data (output files)
+  4. Deduplicates by filename (keeps most recent)
+  5. Downloads or generates SLURM jobs
+
 Examples:
-  # Download all TETRANSCRIPTS outputs
-  python download_data_objects.py --process TETRANSCRIPTS --dir data_te
+  python download_data_objects.py \\
+      --project 523943332699993118 \\
+      --process TETRANSCRIPTS \\
+      --dir data_te
 
-  # Filter by filename substring too
-  python download_data_objects.py --process TETRANSCRIPTS --filename counts --dir data_te
-
-  # Filter results with a local regex on the filename
-  python download_data_objects.py --process TETRANSCRIPTS --regex ".*\\.tsv" --dir data_te
-
-  # Keep all versions (skip deduplication)
-  python download_data_objects.py --process TETRANSCRIPTS --dir data_te --keep-all
-
-  # Generate SLURM jobs
-  python download_data_objects.py --process TETRANSCRIPTS --dir data_te --slurm
+  python download_data_objects.py \\
+      --project 523943332699993118 \\
+      --process TETRANSCRIPTS \\
+      --regex ".*\\.cntTable" \\
+      --dir data_te --slurm
 """,
     )
     parser.add_argument(
-        "--process", "-p", required=True,
-        help="process_execution_name to search for (e.g. TETRANSCRIPTS, CLIPSEQ:PEKA)",
+        "--project", required=True,
+        help="Project ID to search within",
     )
     parser.add_argument(
-        "--filename", "-f", default=None,
-        help="Server-side filename substring filter (sent to /data/search)",
+        "--process", "-p", required=True,
+        help="Process name substring to match (e.g. TETRANSCRIPTS). Case-insensitive.",
     )
     parser.add_argument(
         "--regex", "-r", default=None,
-        help="Local regex to further filter filenames after fetching from API",
+        help="Regex to further filter output filenames locally",
     )
     parser.add_argument(
         "--dir", "-d", required=True,
         help="Output directory for downloaded files",
-    )
-    parser.add_argument(
-        "--keep-all", action="store_true",
-        help="Keep all versions instead of deduplicating by (sample_id, filename)",
-    )
-    parser.add_argument(
-        "--no-sample-id-prefix", action="store_true",
-        help="Don't prefix filenames with sample_id",
     )
     parser.add_argument(
         "--slurm", action="store_true",
@@ -335,13 +334,11 @@ def main():
     args = parse_args()
 
     print(f"Configuration:")
+    print(f"  Project:   {args.project}")
     print(f"  Process:   {args.process}")
-    if args.filename:
-        print(f"  Filename:  {args.filename}")
     if args.regex:
         print(f"  Regex:     {args.regex}")
     print(f"  Dir:       {args.dir}")
-    print(f"  Dedupe:    {'off (--keep-all)' if args.keep_all else 'most recent per (sample_id, filename)'}")
     print()
 
     # Authenticate
@@ -352,54 +349,35 @@ def main():
     with requests.Session() as session:
         session.headers.update({"Authorization": f"Bearer {access_token}"})
 
-        # 1. Search for data objects
-        print(f"\nSearching /data/search for process_execution_name='{args.process}'...")
-        items = search_data_objects(session, process_name=args.process, filename=args.filename)
-        print(f"Found {len(items)} data objects from API")
+        # 1. Find process outputs
+        outputs = find_process_outputs(session, args.project, args.process)
+        print(f"\nFound {len(outputs)} output files from '{args.process}' processes")
 
-        if not items:
-            print("No data objects found. Check the process_execution_name value.")
+        if not outputs:
+            print("No outputs found. Check the project ID and process name.")
             return
 
-        # 2. Apply local regex filter if specified
+        # 2. Apply regex filter
         if args.regex:
             pattern = re.compile(args.regex, re.IGNORECASE)
-            items = [
-                it for it in items
-                if pattern.search(it.get("filename") or it.get("name") or "")
-            ]
-            print(f"After regex filter '{args.regex}': {len(items)} items")
+            outputs = [o for o in outputs if pattern.search(o.get("filename") or "")]
+            print(f"After regex filter: {len(outputs)} files")
 
-        # 3. Deduplicate
-        if not args.keep_all:
-            before = len(items)
-            items = dedupe_by_sample_and_filename(items)
-            removed = before - len(items)
-            if removed:
-                print(f"Deduplication: kept {len(items)} (removed {removed} older duplicates)")
-            else:
-                print(f"Deduplication: no duplicates found ({len(items)} items)")
+        # 3. Format and report
+        records = format_records(outputs)
+        print(f"\n{len(records)} files to download:")
+        for r in records:
+            print(f"  {r['file']['filename']}")
 
-        # 4. Format records
-        include_sample_id = not args.no_sample_id_prefix
-        records = format_records(items, include_sample_id=include_sample_id)
-        print(f"\n{len(records)} files to download")
-
-        # Summarise sample linkage
-        with_sample = sum(1 for r in records if r.get("sample_id"))
-        without_sample = len(records) - with_sample
-        if without_sample:
-            print(f"  {with_sample} linked to a sample, {without_sample} standalone (no sample_id)")
-
-        # 5. Save JSON if requested
+        # 4. Save JSON
         if args.json:
             with open(args.json, "w") as f:
                 json.dump(records, f, indent=2)
-            print(f"Saved records to {args.json}")
+            print(f"\nSaved records to {args.json}")
 
-        # 6. Download or generate SLURM jobs
+        # 5. Download or SLURM
         if args.slurm:
-            generate_slurm_jobs(records, args.dir, args.slurm_dir, include_sample_id)
+            generate_slurm_jobs(records, args.dir, args.slurm_dir)
         else:
             os.makedirs(args.dir, exist_ok=True)
             print(f"\nDownloading to {args.dir}...")
@@ -407,15 +385,14 @@ def main():
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = [
                     executor.submit(download_file, session, r, args.dir,
-                                    include_sample_id=include_sample_id)
+                                    include_sample_id=False)
                     for r in records
                 ]
                 for i, fut in enumerate(as_completed(futures), 1):
                     msg, ok = fut.result()
                     if ok:
                         success += 1
-                    if not ok or i % 50 == 0:
-                        print(f"  [{i}/{len(records)}] {msg}")
+                    print(f"  [{i}/{len(records)}] {msg}")
 
             print(f"\nDone! Downloaded {success}/{len(records)} files to {args.dir}")
 

@@ -155,6 +155,9 @@ def main():
     parser.add_argument("--slurm", action="store_true", help="Generate SLURM jobs instead of downloading")
     parser.add_argument("--slurm-dir", default="slurm_jobs", help="SLURM job directory")
     parser.add_argument("--no-sample-id-prefix", action="store_true", help="Don't prefix filenames with sample_id")
+    parser.add_argument("--pipeline", default=None,
+                        help="Only keep data records from this pipeline (e.g. 'hanalysis clipseq'). "
+                             "Case-insensitive substring match on pipeline_name.")
     args = parser.parse_args()
     
     # Load existing sample IDs
@@ -175,6 +178,8 @@ def main():
     
     compiled_patterns = compile_filename_regexes(args.regex)
     print(f"Regex: {args.regex}")
+    if args.pipeline:
+        print(f"Pipeline filter: {args.pipeline}")
     print(f"Output: {args.dir}")
     
     os.makedirs(args.dir, exist_ok=True)
@@ -188,6 +193,13 @@ def main():
         def process_sample(sample_id):
             try:
                 data_items = get_all_sample_data(session, sample_id)
+                # Filter by pipeline name if specified
+                if args.pipeline:
+                    pipeline_lower = args.pipeline.lower()
+                    data_items = [
+                        item for item in data_items
+                        if pipeline_lower in (item.get("pipeline_name") or "").lower()
+                    ]
                 filtered = filter_by_regex(data_items, compiled_patterns)
                 if len(set(f.get("filename") for f in filtered)) < len(filtered):
                     filtered = dedupe_latest_by_filename(filtered)
