@@ -159,6 +159,40 @@ Options:
   --no-sample-id-prefix  Don't prefix filenames with sample_id
 ```
 
+### `download_data_objects.py`
+
+Downloads data objects directly by `process_execution_name` from the `/data/search` API. Unlike the sample-based scripts, this finds data objects produced by a specific pipeline process — including multi-sample integration outputs (e.g. TEtranscripts) that may not be linked to individual samples.
+
+**Deduplication**: when the same sample has multiple runs of a process, multiple outputs with the same filename exist. By default, only the most recent per `(sample_id, filename)` is kept.
+
+```
+Options:
+  --process, -p        process_execution_name to search for (required)
+  --filename, -f       Server-side filename substring filter (optional)
+  --regex, -r          Local regex to further filter filenames (optional)
+  --dir, -d            Output directory (required)
+  --keep-all           Keep all versions (skip deduplication)
+  --no-sample-id-prefix  Don't prefix filenames with sample_id
+  --slurm              Generate SLURM job scripts instead of downloading
+  --slurm-dir          Directory for SLURM job scripts (default: slurm_jobs)
+  --workers, -w        Parallel download workers (default: 4)
+  --json               Save matched data records to a JSON file
+```
+
+```bash
+# Download all TETRANSCRIPTS outputs
+python download_data_objects.py --process TETRANSCRIPTS --dir data_te
+
+# Filter by filename too
+python download_data_objects.py --process TETRANSCRIPTS --filename counts --dir data_te
+
+# Keep all versions (no dedup)
+python download_data_objects.py --process TETRANSCRIPTS --dir data_te --keep-all
+
+# SLURM mode
+python download_data_objects.py --process TETRANSCRIPTS --dir data_te --slurm
+```
+
 ### `generate_sample_metrics.py`
 
 Generates a CSV with sample metrics from downloaded UMICollapse log files and PEKA motif enrichment data.
