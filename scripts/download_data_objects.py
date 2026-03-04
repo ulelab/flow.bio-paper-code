@@ -169,8 +169,8 @@ def find_process_outputs(session, project_id, process_name_filter):
 def format_records(items):
     """Convert data objects into download records compatible with flow_api.download_file.
 
-    Filenames are prefixed with execution ID and date for uniqueness and
-    traceability: {execution_id}_{YYYY-MM-DD}_{filename}
+    Filenames are prefixed with execution ID and datetime for uniqueness and
+    traceability: {execution_id}_{YYYY-MM-DD_HHmmss}_{filename}
     """
     records = []
     for item in items:
@@ -179,12 +179,12 @@ def format_records(items):
         exec_id = str(item.get("_execution_id") or "").strip()
         if not data_id or not filename:
             continue
-        # Build date string from execution created timestamp
+        # Build datetime string from execution created timestamp
         date_str = ""
         exec_created = item.get("_execution_created")
         if exec_created and isinstance(exec_created, (int, float)):
             try:
-                date_str = datetime.fromtimestamp(exec_created, tz=timezone.utc).strftime("%Y-%m-%d")
+                date_str = datetime.fromtimestamp(exec_created, tz=timezone.utc).strftime("%Y-%m-%d_%H%M%S")
             except (OSError, ValueError):
                 pass
         # Prefix with execution ID and date for uniqueness

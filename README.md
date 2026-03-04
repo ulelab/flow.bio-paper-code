@@ -167,7 +167,7 @@ Downloads data objects produced by a specific pipeline process within a project.
 
 It works by navigating: **project → executions → process steps → downstream_data**.
 
-**File naming**: output filenames are prefixed with their execution ID and date (`{execution_id}_{YYYY-MM-DD}_{filename}`) since each execution produces identically-named files (e.g. `control.cntTable`). This ensures outputs from different executions don't overwrite each other and makes it easy to identify when each execution was run.
+**File naming**: output filenames are prefixed with their execution ID and datetime (`{execution_id}_{YYYY-MM-DD_HHmmss}_{filename}`) since each execution produces identically-named files (e.g. `control.cntTable`). This ensures outputs from different executions don't overwrite each other and makes it easy to identify when each execution was run.
 
 ```
 Options:
