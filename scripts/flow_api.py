@@ -285,12 +285,15 @@ def download_file(
     sample_id = str(record.get("sample_id") or "").strip()
     data_id = str(file_obj.get("id") or "").strip()
     original_filename = str(file_obj.get("filename") or file_obj.get("name") or "").strip()
+    save_as = str(file_obj.get("save_as") or "").strip()
     
     if not data_id or not original_filename:
         return ("Missing id/filename; skipping", False)
     
-    # Prefix filename with sample_id for traceability
-    if include_sample_id and sample_id:
+    # Use explicit save_as if provided, otherwise prefix with sample_id
+    if save_as:
+        filename = os.path.basename(save_as)
+    elif include_sample_id and sample_id:
         filename = f"{sample_id}_{os.path.basename(original_filename)}"
     else:
         filename = os.path.basename(original_filename)

@@ -199,7 +199,8 @@ def format_records(items):
             "sample_name": "",
             "file": {
                 "id": data_id,
-                "filename": prefixed_filename,
+                "filename": filename,
+                "save_as": prefixed_filename,
             },
             "_execution_id": exec_id,
             "_process_name": item.get("_process_name", ""),
@@ -218,12 +219,13 @@ def generate_slurm_jobs(records, data_dir, slurm_dir):
     for i, record in enumerate(records):
         file_obj = record.get("file", {})
         data_id = str(file_obj.get("id") or "").strip()
-        filename = str(file_obj.get("filename") or "").strip()  # already prefixed with exec id
-        if not data_id or not filename:
+        original_filename = str(file_obj.get("filename") or "").strip()
+        save_as = str(file_obj.get("save_as") or "").strip() or original_filename
+        if not data_id or not original_filename:
             continue
 
-        url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(filename)}"
-        dest_path = os.path.join(os.path.abspath(data_dir), filename)
+        url = f"https://app.flow.bio/files/downloads/{quote(data_id)}/{quote(original_filename)}"
+        dest_path = os.path.join(os.path.abspath(data_dir), save_as)
 
         job_name = f"dl_{i:05d}"
         job_script = os.path.join(slurm_dir, f"{job_name}.sh")
@@ -237,7 +239,7 @@ def generate_slurm_jobs(records, data_dir, slurm_dir):
 #SBATCH --cpus-per-task=1
 
 curl -L -o "{dest_path}" "{url}" || exit 1
-echo "Downloaded: {filename}"
+echo "Downloaded: {save_as}"
 """)
         job_files.append(job_script)
 
@@ -277,7 +279,7 @@ How it works:
   1. Lists all pipeline executions in the project
   2. For each execution, finds process steps matching --process
   3. Collects their downstream_data (output files)
-  4. Deduplicates by filename (keeps most recent)
+  4. Prefixes filenames with execution ID and date for uniqueness
   5. Downloads or generates SLURM jobs
 
 Examples:
