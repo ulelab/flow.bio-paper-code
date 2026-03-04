@@ -35,8 +35,10 @@ from flow_api import (
     load_credentials,
     get_access_token,
     get_all_public_samples,
+    get_project_samples,
     get_all_sample_data,
     filter_samples_by_type,
+    filter_samples_by_organism,
     compile_filename_regexes,
     filter_by_regex,
     dedupe_latest_by_filename,
@@ -129,6 +131,21 @@ Examples:
         action="store_true",
         help="Don't prefix filenames with sample_id (not recommended)"
     )
+    parser.add_argument(
+        "--organism",
+        default=None,
+        help="Filter samples by organism (e.g. 'Human', 'Mouse'). Case-insensitive."
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Fetch samples from a specific project ID (includes private projects you have access to)"
+    )
+    parser.add_argument(
+        "--pipeline",
+        default=None,
+        help="Only keep data records from this pipeline (e.g. 'hanalysis clipseq'). Case-insensitive substring match."
+    )
     return parser.parse_args()
 
 
@@ -140,6 +157,7 @@ def process_sample(
     session: requests.Session,
     compiled_patterns: List,
     sample: Dict[str, Any],
+    pipeline_filter: str | None = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Process a single sample: fetch data, filter, and return matching files."""
     sample_id = str(
@@ -165,6 +183,16 @@ def process_sample(
     total_count = len(data_items)
     if total_count < 10:
         return (f"Skipping sample {sample_id}: only {total_count} data records (<10)", [])
+
+    # Filter by pipeline name if specified
+    if pipeline_filter:
+        pipeline_lower = pipeline_filter.lower()
+        data_items = [
+            item for item in data_items
+            if pipeline_lower in (item.get("pipeline_name") or "").lower()
+        ]
+        if not data_items:
+            return (f"Skipping sample {sample_id}: no data records from pipeline '{pipeline_filter}'", [])
 
     filtered_items = filter_by_regex(data_items, compiled_patterns)
     unique_names = set((it.get("filename") or it.get("name") or "") for it in filtered_items)
@@ -490,9 +518,15 @@ def main() -> None:
         return
 
     print(f"\nConfiguration:")
-    print(f"  Regex:  {filename_regex}")
-    print(f"  Dir:    {data_dir}")
-    print(f"  JSON:   {json_file}")
+    print(f"  Regex:     {filename_regex}")
+    print(f"  Dir:       {data_dir}")
+    print(f"  JSON:      {json_file}")
+    if args.organism:
+        print(f"  Organism:  {args.organism}")
+    if args.project:
+        print(f"  Project:   {args.project}")
+    if args.pipeline:
+        print(f"  Pipeline:  {args.pipeline}")
     print()
 
     with requests.Session() as session:
@@ -516,15 +550,27 @@ def main() -> None:
         
         samples = None
         if not all_data:
-            print("Fetching public samples...")
-            samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
-            samples = filter_samples_by_type(samples, SAMPLE_TYPE)
-            print(f"Found {len(samples)} public samples of type {SAMPLE_TYPE}")
+            if args.project:
+                print(f"Fetching samples from project {args.project}...")
+                samples = get_project_samples(session, args.project)
+                samples = filter_samples_by_type(samples, SAMPLE_TYPE)
+                print(f"Found {len(samples)} samples of type {SAMPLE_TYPE} in project")
+            else:
+                print("Fetching public samples...")
+                samples = get_all_public_samples(session, sample_type=SAMPLE_TYPE)
+                samples = filter_samples_by_type(samples, SAMPLE_TYPE)
+                print(f"Found {len(samples)} public samples of type {SAMPLE_TYPE}")
+
+            # Filter by organism if specified
+            if args.organism:
+                samples = filter_samples_by_organism(samples, args.organism)
+                print(f"After organism filter ('{args.organism}'): {len(samples)} samples")
 
             # Process samples in parallel
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = [
-                    executor.submit(process_sample, session, compiled_patterns, s)
+                    executor.submit(process_sample, session, compiled_patterns, s,
+                                    pipeline_filter=args.pipeline)
                     for s in samples
                 ]
                 for fut in as_completed(futures):

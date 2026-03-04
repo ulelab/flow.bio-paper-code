@@ -51,6 +51,12 @@ python download_files.py --fresh
 
 # Or use cached sample list (faster, uses existing filtered_data.json)
 python download_files.py
+
+# Download only human samples
+python download_files.py --fresh --organism Human
+
+# Download from a private project with a specific pipeline
+python download_files.py --project <PROJECT_ID> --pipeline "hanalysis clipseq"
 ```
 
 **Note**: The `--fresh` flag fetches all public samples from the API, which can take 10-30 minutes depending on the number of samples.
@@ -131,6 +137,11 @@ Options:
   --slurm              Generate SLURM job scripts instead of downloading
   --slurm-dir          Directory for SLURM job scripts (default: slurm_jobs)
   --no-sample-id-prefix  Don't prefix filenames with sample_id (not recommended)
+  --organism           Filter samples by organism (e.g. 'Human', 'Mouse'). Case-insensitive.
+  --project            Fetch samples from a specific project ID instead of public samples
+                       (includes private projects you have access to)
+  --pipeline           Only keep data records from a given pipeline (e.g. 'hanalysis clipseq').
+                       Case-insensitive substring match on the pipeline_name field.
 ```
 
 ### `download_additional_files.py`
@@ -226,6 +237,10 @@ For large downloads on HPC clusters, use the `--slurm` flag to generate job scri
 ```bash
 # 1. Generate SLURM job scripts (no downloads yet)
 python download_files.py --slurm --slurm-dir slurm_logs
+
+# Or with filters (human-only, specific project/pipeline)
+python download_files.py --slurm --slurm-dir slurm_logs --organism Human
+python download_files.py --slurm --slurm-dir slurm_logs --project <PROJECT_ID> --pipeline "hanalysis clipseq"
 
 # 2. Submit as array job (efficient)
 sbatch slurm_logs/submit_array.sh

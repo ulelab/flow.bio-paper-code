@@ -132,6 +132,15 @@ def get_all_public_samples(
     return list(paginate_items(session, f"{base_url}/samples/public", params))
 
 
+def get_project_samples(
+    session: requests.Session,
+    project_id: str,
+    base_url: str = DEFAULT_BASE_URL,
+) -> List[Dict[str, Any]]:
+    """Fetch all samples belonging to a specific project (public or private)."""
+    return list(paginate_items(session, f"{base_url}/projects/{project_id}/samples"))
+
+
 def get_all_sample_data(
     session: requests.Session,
     sample_id: str,
@@ -161,6 +170,28 @@ def filter_samples_by_type(
     """Filter samples to only include those matching the given type."""
     desired = sample_type.upper()
     return [s for s in samples if get_sample_type_str(s) == desired]
+
+
+def get_organism_str(sample: Dict[str, Any]) -> str:
+    """
+    Extract the organism name as a lowercase string.
+
+    Handles both plain strings and dict objects like:
+    {'id': 'Hs', 'name': 'Human'}
+    """
+    org = sample.get("organism") or ""
+    if isinstance(org, dict):
+        return str(org.get("name") or org.get("id") or "").strip().lower()
+    return str(org).strip().lower()
+
+
+def filter_samples_by_organism(
+    samples: List[Dict[str, Any]],
+    organism: str,
+) -> List[Dict[str, Any]]:
+    """Filter samples to only include those matching the given organism (case-insensitive)."""
+    desired = organism.strip().lower()
+    return [s for s in samples if get_organism_str(s) == desired]
 
 
 # --- Filename filtering utilities ---
