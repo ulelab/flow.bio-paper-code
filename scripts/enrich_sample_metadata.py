@@ -14,6 +14,8 @@ import os
 import sys
 import json
 import time
+import argparse
+from datetime import datetime
 from typing import Dict, List, Any
 
 try:
@@ -29,10 +31,39 @@ from flow_api import load_credentials, get_access_token
 # =============================================================================
 
 BASE_URL = "https://api.flow.bio"
-INPUT_JSON = "filtered_data.json"
-OUTPUT_JSON = "filtered_data.json"  # Overwrite with enriched data
+DEFAULT_INPUT_JSON = "filtered_data.json"
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "credentials.json")
 REQUEST_DELAY = 0.25  # Delay between API calls to avoid rate limiting
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Enrich filtered Flow file records with full sample metadata"
+    )
+    parser.add_argument(
+        "--input-json", "-i",
+        default=DEFAULT_INPUT_JSON,
+        help=f"Input JSON file with sample_id fields (default: {DEFAULT_INPUT_JSON})"
+    )
+    parser.add_argument(
+        "--output-json", "-o",
+        default=None,
+        help="Output JSON path (default: overwrite input JSON)"
+    )
+    parser.add_argument(
+        "--timestamp-output",
+        action="store_true",
+        help="Append a human-readable timestamp to the output JSON filename"
+    )
+    return parser.parse_args()
+
+
+def add_timestamp_to_filename(path: str) -> str:
+    """Append a timestamp before the file extension."""
+    base, ext = os.path.splitext(path)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return f"{base}_{timestamp}{ext}"
 
 
 # =============================================================================
@@ -56,19 +87,25 @@ def get_sample_metadata(
 # =============================================================================
 
 def main() -> None:
+    args = parse_args()
+    input_json = args.input_json
+    output_json = args.output_json or input_json
+    if args.timestamp_output:
+        output_json = add_timestamp_to_filename(output_json)
+
     # Load existing filtered_data.json
-    if not os.path.exists(INPUT_JSON):
-        print(f"Input file not found: {INPUT_JSON}", file=sys.stderr)
+    if not os.path.exists(input_json):
+        print(f"Input file not found: {input_json}", file=sys.stderr)
         sys.exit(1)
     
-    with open(INPUT_JSON, "r", encoding="utf-8") as f:
+    with open(input_json, "r", encoding="utf-8") as f:
         data = json.load(f)
     
     if not isinstance(data, list):
-        print(f"Expected list in {INPUT_JSON}, got {type(data)}", file=sys.stderr)
+        print(f"Expected list in {input_json}, got {type(data)}", file=sys.stderr)
         sys.exit(1)
     
-    print(f"Loaded {len(data)} records from {INPUT_JSON}")
+    print(f"Loaded {len(data)} records from {input_json}")
     
     # Get unique sample IDs
     sample_ids = list(set(
@@ -126,10 +163,10 @@ def main() -> None:
             record["sample_metadata"] = sample_metadata[sample_id]
     
     # Save enriched data
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+    with open(output_json, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     
-    print(f"\nSaved enriched data to {OUTPUT_JSON}")
+    print(f"\nSaved enriched data to {output_json}")
     
     # Summary of key categorization fields
     print("\n=== Metadata Summary ===")
