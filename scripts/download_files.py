@@ -406,7 +406,7 @@ echo "All jobs submitted. Monitor with: squeue -u $USER"
     os.chmod(master_script, 0o755)
     
     # Create array job scripts (split into batches to respect job limits)
-    max_array = 500  # Safe default below most admin limits
+    max_array = 200  # Cluster limit for max jobs per array batch
     n_jobs = len(job_files)
     n_batches = (n_jobs + max_array - 1) // max_array
     
