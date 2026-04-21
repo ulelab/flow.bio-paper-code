@@ -22,6 +22,7 @@ import argparse
 import os
 import sys
 import json
+from datetime import datetime
 from typing import Dict, List, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -107,6 +108,11 @@ Examples:
         help=f"JSON file for caching file metadata (default: {DEFAULT_JSON})"
     )
     parser.add_argument(
+        "--timestamp-json",
+        action="store_true",
+        help="Append a human-readable timestamp to the JSON filename"
+    )
+    parser.add_argument(
         "--fresh", "-f",
         action="store_true",
         help="Force fresh API fetch, ignore cached JSON"
@@ -147,6 +153,13 @@ Examples:
         help="Only keep data records from this pipeline (e.g. 'hanalysis clipseq'). Case-insensitive substring match."
     )
     return parser.parse_args()
+
+
+def add_timestamp_to_filename(path: str) -> str:
+    """Append a timestamp before the file extension."""
+    base, ext = os.path.splitext(path)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return f"{base}_{timestamp}{ext}"
 
 
 # =============================================================================
@@ -503,6 +516,8 @@ def main() -> None:
     filename_regex = args.regex
     data_dir = args.dir
     json_file = args.json
+    if args.timestamp_json:
+        json_file = add_timestamp_to_filename(json_file)
     
     username, password = load_credentials(CREDENTIALS_PATH)
     compiled_patterns = compile_filename_regexes(filename_regex)
