@@ -6,6 +6,7 @@ Usage:
     python download_files.py                           # Download UMICollapse logs (default)
     python download_files.py --debug                   # Show first sample's data records
     python download_files.py --regex ".*subtype.*tsv" --dir data_subtype --json subtype_data.json
+    python download_files.py --latest-per-sample       # Keep only latest matched file per sample
     
 Examples:
     # Download UMICollapse log files (default)
@@ -16,6 +17,9 @@ Examples:
     
     # Download gene TSV files  
     python download_files.py --regex ".*gene_premapadjusted\\.tsv" --dir data_gene --json gene_data.json
+
+    # Keep only the most recent matched file per sample (regardless of filename)
+    python download_files.py --regex ".*subtype.*tsv" --latest-per-sample
 """
 
 import argparse
@@ -152,6 +156,11 @@ Examples:
         default=None,
         help="Only keep data records from this pipeline (e.g. 'hanalysis clipseq'). Case-insensitive substring match."
     )
+    parser.add_argument(
+        "--latest-per-sample",
+        action="store_true",
+        help="Keep only the most recent matched file per sample_id, even when filenames differ"
+    )
     return parser.parse_args()
 
 
@@ -160,6 +169,45 @@ def add_timestamp_to_filename(path: str) -> str:
     base, ext = os.path.splitext(path)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     return f"{base}_{timestamp}{ext}"
+
+
+def _to_timestamp(value: Any) -> float:
+    """Convert common timestamp formats to Unix timestamp."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(value).timestamp()
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def dedupe_latest_by_sample_id(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only the latest data record per sample_id based on file created timestamp."""
+    best_by_sample: Dict[str, Dict[str, Any]] = {}
+    best_ts_by_sample: Dict[str, float] = {}
+    no_sample_id_records: List[Dict[str, Any]] = []
+
+    for record in records:
+        sample_id = str(record.get("sample_id") or "").strip()
+        if not sample_id:
+            no_sample_id_records.append(record)
+            continue
+
+        file_obj = record.get("file") or {}
+        created_raw = file_obj.get("created") or file_obj.get("created_at") or file_obj.get("timestamp")
+        ts = _to_timestamp(created_raw)
+        prev_ts = best_ts_by_sample.get(sample_id, -1.0)
+        if ts >= prev_ts:
+            best_ts_by_sample[sample_id] = ts
+            best_by_sample[sample_id] = record
+
+    return list(best_by_sample.values()) + no_sample_id_records
 
 
 # =============================================================================
@@ -536,6 +584,8 @@ def main() -> None:
     print(f"  Regex:     {filename_regex}")
     print(f"  Dir:       {data_dir}")
     print(f"  JSON:      {json_file}")
+    if args.latest_per_sample:
+        print("  Latest:    Keep only latest matched file per sample")
     if args.organism:
         print(f"  Organism:  {args.organism}")
     if args.project:
@@ -594,6 +644,15 @@ def main() -> None:
                         print(msg)
                     if results:
                         all_data.extend(results)
+
+        if args.latest_per_sample:
+            before_count = len(all_data)
+            all_data = dedupe_latest_by_sample_id(all_data)
+            removed_count = before_count - len(all_data)
+            print(
+                "Applied latest-per-sample filter: "
+                f"kept {len(all_data)} records, removed {removed_count}"
+            )
 
         # Summary
         if samples is None:
