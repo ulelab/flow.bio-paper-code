@@ -17,3 +17,5 @@ scripts/peka_multiqc_summary.py
 data*
 .github/copilot-instructions.md
 *log
+*slurm*
+*tmp*

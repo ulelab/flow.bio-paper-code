@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Fast download of additional files for existing samples.
 
 Uses sample IDs from filtered_data.json (already fetched) to download
@@ -30,6 +30,7 @@ from flow_api import (
     dedupe_latest_by_filename,
     download_file,
 )
+from download_files import dedupe_latest_by_sample_id
 
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "credentials.json")
 SOURCE_JSON = "filtered_data.json"
@@ -158,6 +159,14 @@ def main():
     parser.add_argument("--pipeline", default=None,
                         help="Only keep data records from this pipeline (e.g. 'hanalysis clipseq'). "
                              "Case-insensitive substring match on pipeline_name.")
+    parser.add_argument(
+        "--latest-per-sample",
+        action="store_true",
+        help=(
+            "Keep only the most recent matched file per sample_id, even when "
+            "filenames differ. Useful when several outputs match one regex."
+        ),
+    )
     args = parser.parse_args()
     
     # Load existing sample IDs
@@ -222,7 +231,15 @@ def main():
                     print(f"  Processed {completed}/{len(sample_ids)} samples, found {len(all_files)} files...")
         
         print(f"\nFound {len(all_files)} matching files")
-        
+
+        if args.latest_per_sample:
+            before = len(all_files)
+            all_files = dedupe_latest_by_sample_id(all_files)
+            print(
+                f"Latest-per-sample: kept {len(all_files)} files "
+                f"(dropped {before - len(all_files)} older matches)"
+            )
+
         if not all_files:
             print("No files matched the regex pattern!")
             return

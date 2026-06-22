@@ -159,6 +159,162 @@ Options:
   --no-sample-id-prefix  Don't prefix filenames with sample_id
   --pipeline     Only keep data records from this pipeline (e.g. 'hanalysis clipseq').
                  Case-insensitive substring match.
+  --latest-per-sample
+                 Keep only the most recent matched file per sample_id, even
+                 when several different filenames match the regex.
+```
+
+## Full CLIP Sample Status Pull (bedgraph + UMICollapse)
+
+Refreshes the master spreadsheet of every public CLIP sample on Flow.bio with
+its latest CLIP-seq v1.7 (and v1.6 fallback) `genome.xl.bedgraph`,
+`UMICollapse.log`, and PEKA whole-gene 5mer distribution
+(`genome_5mer_distribution_whole_gene.tsv`) status. Downloads the matched
+UMICollapse logs and computes per-sample PCR duplication / crosslink count QC.
+PEKA files are tracked for presence + data ID only (not downloaded — too
+large); fetch them on demand with `download_additional_files.py`.
+
+Driver script: [scripts/build_clipseq_v17_sample_status.py](scripts/build_clipseq_v17_sample_status.py).
+
+### Run it
+
+```bash
+conda activate bioinf
+
+python scripts/build_clipseq_v17_sample_status.py \
+    --timestamp-output \
+    --download-umicollapse-logs \
+    --slim-output-csv scripts/clipseq_v17_sample_status_slim.csv \
+    --workers 24
+```
+
+`--timestamp-output` appends `_YYYY-MM-DD_HHMMSS` to the output stem, so each
+run is preserved. With the defaults, output is:
+
+| Path | Contents |
+|------|----------|
+| `scripts/clipseq_v17_sample_status_<ts>.csv` | One row per CLIP sample, ~100 columns: bedgraph/UMI presence, execution IDs, retry chains, QC metrics, full sample metadata. |
+| `scripts/clipseq_v17_sample_status_<ts>_no_clipseq_execution.csv` | Samples with no v1.7 or v1.6 clipseq execution (chase-up list). |
+| `scripts/clipseq_v17_sample_status_slim.csv` | Compact metrics-focused subset. |
+| `scripts/data_v17_umicollapse/<sample_id>_<filename>` | Downloaded UMICollapse logs (one per sample). |
+
+### Key flags
+
+- `--pipeline-version 1.7` / `--fallback-pipeline-version 1.6` — change which pipeline versions are accepted. Pass empty string to disable fallback.
+- `--workers N` — parallelism for API calls (default 24). Lower if the API rate-limits.
+- `--max-samples N` — smoketest a small batch first.
+- `--sample-source samples_search|project_shard` — `project_shard` is slower but more thorough for catching samples missed by the global list.
+- `--download-umicollapse-logs` — required to populate `umicollapse_input_reads`, `umicollapse_dedup_reads`, `pcr_duplication_rate`, `millions_of_crosslinks`.
+- `--peka-regex` — override the PEKA filename pattern (default `genome_5mer_distribution_whole_gene.tsv$`).
+
+### PEKA columns
+
+For each sample the CSV contains:
+
+- `has_peka_whole_gene`, `latest_used_peka_whole_gene_filename`, `latest_used_peka_whole_gene_data_id`, `latest_used_peka_whole_gene_created`, `latest_used_peka_whole_gene_pipeline_name` — the "used" rollup (whichever pipeline version was selected).
+- `has_v17_peka_whole_gene`, `latest_v17_peka_whole_gene_{filename,data_id,created,pipeline_name}`, `used_v17_retry_chain_for_peka` — v1.7-specific.
+- Equivalent `v16` columns for the v1.6 fallback.
+
+### Status string
+
+One column. Two shapes:
+
+- **`has_bedgraph_and_umicollapse_and_peka`** — all three resolved. (No matter which fallback layer found them; the layer is recorded in the per-artifact `used_v17_*_fallback_for_*` columns for diagnostics.)
+- **`missing_<what>[_because_<why>]`** — at least one artifact missing. `<what>` is the missing artifacts joined by `_and_`. `_because_<why>` is appended only when a known systemic reason explains the absence:
+  - `_because_no_clipseq_execution` — no v1.7 or v1.6 execution exists.
+  - `_because_clipseq_execution_has_no_sample_records` — the execution exists but the per-sample data join is empty and no fallback rescued anything.
+
+Examples seen in practice:
+
+| Status | Meaning |
+|---|---|
+| `has_bedgraph_and_umicollapse_and_peka` | ready for downstream analysis |
+| `missing_peka` | PEKA didn't run / wasn't produced |
+| `missing_umicollapse` | UMI log unavailable; bedgraph and PEKA present |
+| `missing_bedgraph_and_peka` | only UMI was produced |
+| `missing_bedgraph_and_umicollapse_and_peka_because_no_clipseq_execution` | sample has never run through CLIP-Seq |
+| `missing_bedgraph_and_umicollapse_and_peka_because_clipseq_execution_has_no_sample_records` | execution exists but the data join is broken on the platform side |
+
+To check which fallback layer found a given artifact (when status is `has_*`), look at `used_v17_retry_chain_for_<artifact>`, `used_v17_alt_ok_execution_for_<artifact>`, `used_v17_execution_filename_fallback_for_<artifact>` (and the v16 equivalents). The actual pipeline version used per row is in `pipeline_version_used`.
+
+### Fallback layers for finding outputs
+
+The script picks the **latest matching execution** per sample (v1.7 first, v1.6 fallback) and looks for bedgraph / UMI / PEKA among that execution's downstream data. When the strict pass misses an artifact, it tries each fallback in turn:
+
+1. **Retry chain** — primary execution + any executions linked via `retries`. Status column suffix: `_with_*_retry_chain_fallback`. Flag: `used_v17_retry_chain_for_*`.
+2. **Alt-OK execution pool** — other OK executions at the same pipeline version, not in the retry chain. Catches the case where the latest OK run didn't actually produce outputs for this sample but an earlier OK run did. Status: `_with_*_alt_ok_execution_fallback`. Flags: `used_v17_alt_ok_execution_for_*`, `v17_alt_ok_execution_ids`.
+3. **Execution filename-prefix scan** — scans the pooled execution downstream (retry chain ∪ alt-OK) for filenames starting with `<sample_name>[._]` and matching the artifact regex. Catches multi-sample executions where `samples/{id}/data` doesn't back-link the outputs. Status: `_with_*_execution_filename_fallback`. Flag: `used_v17_execution_filename_fallback_for_*`.
+
+The summary at the end of a run prints how many samples needed each fallback layer.
+
+### Smoketest first
+
+The full pull hits the API thousands of times and takes a few hours. Before a full run, sanity-check with:
+
+```bash
+python scripts/build_clipseq_v17_sample_status.py \
+    --max-samples 50 \
+    --download-umicollapse-logs \
+    --timestamp-output \
+    -o scripts/clipseq_v17_sample_status_smoketest.csv
+```
+
+### Refresh slim metrics only
+
+If you only need to regenerate the slim CSV from an existing full CSV (no API
+calls):
+
+```bash
+python scripts/export_clipseq_v17_slim_metrics.py \
+    --input scripts/clipseq_v17_sample_status_<ts>.csv \
+    --output scripts/clipseq_v17_sample_status_slim.csv
+```
+
+### Rewrite status column without re-pulling
+
+After a change to the status-building logic, rewrite the `status` column on
+an existing CSV (and regenerate slim) without re-querying the API:
+
+```bash
+python scripts/recompute_status_with_peka.py \
+    --input-csv scripts/clipseq_v17_sample_status_<ts>.csv
+```
+
+Writes `<ts>_status_recomputed.csv` next to the input, and overwrites
+`scripts/clipseq_v17_sample_status_slim.csv`.
+
+## Lambert Paper May 28 2026 Peak BED Download
+
+The Lambert paper sample list is in `lambert_paper_may2826_METADATA.csv`.
+For Flow.bio downloads, use the execution-aware helper
+`scripts/build_lambert_clipseq_peak_metadata.py`. It reuses the CLIP-seq
+v1.7/v1.6 execution lookup code from `scripts/build_clipseq_v17_sample_status.py`
+so peak candidates are restricted to downstream outputs from CLIP-seq pipeline
+versions 1.7 or 1.6. The current source list is
+`lambert_paper_may2826_sample_ids.json`; use it rather than reparsing the CSV
+directly, because the CSV has one sample ID rendered in scientific notation
+(`iCLIP_TDP43_HUVEC_2` / `677452933401`).
+
+To refresh the latest CLIP-seq v1.6/v1.7 peak BEDs and supplementary metadata:
+
+```bash
+python scripts/build_lambert_clipseq_peak_metadata.py \
+    --workers 8
+```
+
+This mirrors the bedgraph retrieval pattern, but with the stricter execution
+lineage gate: resolve the allowed CLIP-seq executions, collect their
+`downstream_data` IDs, filter those records by `*minGeneCount5_Peaks.bed`, and
+select the latest peak by `created` timestamp. The v1.6/v1.7-only output
+directory currently contains 144 non-empty `*minGeneCount5_Peaks.bed` files for
+144 unique sample IDs: 100 selected from CLIP-seq v1.7 and 44 selected from
+CLIP-seq v1.6.
+
+For manuscript supplementary information, the metadata table with the latest
+CLIP-seq v1.6/v1.7 peak BED Flow data IDs is:
+
+```text
+lambert_paper_may2826_METADATA_with_clipseq_v16_v17_peak_bed_ids.csv
 ```
 
 ### `download_data_objects.py`
